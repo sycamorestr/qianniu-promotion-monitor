@@ -1,0 +1,8 @@
+{
+  "allowedBrowserUsers": ["示例店铺"],
+  "profiles": [
+    { "profile": "", "browserUser": "示例店铺", "expectedAlimamaShop": "" }
+  ],
+  "thresholds": { "notifyRoiBelow": 2, "closeChargeAbove": 30, "closeRoiBelow": 1.5 },
+  "limits": { "pageSize": 500, "maxPages": 50, "retries": 3 }
+}

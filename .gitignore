@@ -1,0 +1,13 @@
+config.json
+config.*.local.json
+audit/
+backups/
+dist/
+node_modules/
+*.tgz
+*.zip
+*.bak
+*.backups/
+.env
+.env.*
+*.log

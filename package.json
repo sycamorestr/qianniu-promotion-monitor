@@ -1,0 +1,24 @@
+{
+  "name": "qianniu-promotion-monitor",
+  "version": "1.0.0",
+  "description": "Portable Alimama campaign inspection skill with explicit pause authorization",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "install:skill": "node scripts/install.mjs",
+    "report": "node runner.mjs --mode report",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "runner.mjs",
+    "config.example.json",
+    "adapters/",
+    "scripts/",
+    "references/",
+    "tests/"
+  ]
+}
