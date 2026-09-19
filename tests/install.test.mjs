@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { install, parseArgs } from '../scripts/install.mjs';
 import { checkEnvironment } from '../scripts/check.mjs';
-import { resolveOpencli, validateConfig } from '../runner.mjs';
+import { createOpencli, minimumOpencliOuterTimeoutMs, resolveOpencli, validateConfig,
+  validateOpencliTimeoutBudget } from '../runner.mjs';
 
 const names = ['scan-campaigns.js', 'pause-campaign.js', 'whoami.js'];
 const config = {
@@ -138,6 +139,21 @@ test('Windows launcher selection prefers PowerShell and rejects batch-only insta
   await writeFile(path.join(batchDir, 'opencli.cmd'), 'fixture');
   assert.throws(() => resolveOpencli({ PATH: batchDir }, 'win32'), /OpenCLI not found/);
   assert.throws(() => resolveOpencli({ OPENCLI_BIN: path.join(batchDir, 'opencli.cmd') }, 'win32'), /\.cmd\/\.bat/);
+});
+
+test('runner outer timeout cannot expire before command failure evidence is collected', async t => {
+  const f = await fixture(t);
+  const launcher = path.join(f.directory, process.platform === 'win32' ? 'opencli.ps1' : 'opencli');
+  await writeFile(launcher, 'This file must never be executed.');
+  if (process.platform !== 'win32') await chmod(launcher, 0o755);
+  assert.equal(minimumOpencliOuterTimeoutMs(180), 420000);
+  assert.equal(minimumOpencliOuterTimeoutMs(60), 180000);
+  assert.throws(() => validateOpencliTimeoutBudget(419999, 180), /failure-evidence timeouts/);
+  assert.doesNotThrow(() => validateOpencliTimeoutBudget(420000, 180));
+  assert.throws(() => validateOpencliTimeoutBudget(179999, 60), /failure-evidence timeouts/);
+  assert.doesNotThrow(() => validateOpencliTimeoutBudget(180000, 60));
+  const callOpencli = createOpencli({ OPENCLI_BIN: launcher, OPENCLI_TIMEOUT_MS: '419999', PATH: '' });
+  assert.throws(() => callOpencli(['alimama', 'scan-campaigns', '--timeout', '180']), /failure-evidence timeouts/);
 });
 
 test('dependency checks locate fake commands without execution and keep webhook values private', async t => {

@@ -11,9 +11,11 @@ qianniu-promotion-monitor/
 ├── package.json               Node 要求、命令、分享文件白名单
 ├── config.example.json        不含真实店铺的配置模板
 ├── runner.mjs                 串行调度、身份核对、规则、审计、通知
+├── recovery.mjs               agent 恢复、受控重试、最终通知入口
+├── messages.mjs               店铺巡检与末尾集中暂停汇总
 ├── adapters/
-│   ├── scan-campaigns.js       单页合并扫描两类推广
-│   ├── pause-campaign.js       写入前重查、暂停、写入后复核
+│   ├── scan-campaigns.js       首次合并扫描；--targets 仅查询待暂停记录
+│   ├── pause-campaign.js       按单计划 ID 写前重查、暂停、写后复核
 │   └── whoami.js              手工核对页面身份
 ├── scripts/
 │   ├── install.mjs            安装 Skill 和 OpenCLI 适配器
@@ -38,7 +40,7 @@ qianniu-promotion-monitor/
 | PowerShell 7（Windows） | 使用 OpenCLI 的 `.ps1` 启动器时需能找到 `pwsh.exe` |
 | 企业微信 Webhook | 仅 `dry-run`、`execute` 必需，从当前进程 `WECHAT_WEBHOOK_URL` 读取 |
 
-如需安装已知版本的 OpenCLI，可在目标机器执行 `npm install -g @jackwener/opencli@1.8.7`，再按其文档完成 Browser Bridge 和 profile 设置。本包不会自动下载依赖或自动登录。
+如需安装已知版本的 OpenCLI，可在目标机器执行 `npm install -g @jackwener/opencli@1.8.7`，再按其文档完成 Browser Bridge 和 profile 设置。本包不会自动下载依赖或自动登录。浏览器命令默认使用 180 秒的命令级超时，runner 外层默认保留 420 秒；若通过环境变量调整，`OPENCLI_TIMEOUT_MS` 必须至少为两倍命令级秒数再加 60 秒，为失败证据采集和进程收尾留出空间，避免父进程先强杀 OpenCLI。
 
 OpenCLI 1.8.7 正常启动时会自动建立用户命令的 ESM 配置和 registry 包链接，因此新机器只需安装 OpenCLI 并复制适配器，无需迁移旧机器的 `node_modules`。
 
@@ -86,12 +88,15 @@ node scripts/install.mjs --config <旧目录>/config.json --audit-from <旧目�
 | `node runner.mjs --mode report` | 不发送通知、不暂停，即使已设置 Webhook |
 | `node runner.mjs --mode dry-run` | 按用户要求发送最终提醒和待暂停清单，不暂停 |
 | `node runner.mjs --mode execute` | 仅在用户明确授权后使用；运行器负责复核、执行、核验和最终通知 |
+| `node runner.mjs --recover RUN_ID` | agent 接管异常后的只读核验，不暂停、不通知 |
+| `node runner.mjs --recover RUN_ID --retry-pauses --settled-profiles PROFILE` | agent 确认旧操作结束后，重新核验再受控重试，每计划最多一次 |
+| `node runner.mjs --finalize RUN_ID` | 仅从该轮最终审计发送结果，不重扫、不重写 |
 
-通知由运行器按配置顺序分店铺分区，使用 `# / ## / ###` 标题层级形成清晰字号，并用 `info`（绿色）、`warning`（橙色）和 `comment`（灰色）表达状态/指标；只展示直接结论与必要指标：`execute` 使用“推广已暂停 / 推广未暂停”，`dry-run` 使用“建议暂停”。数量为 0 的暂停状态不展示；没有候选时直接说明无符合暂停条件的推广。不要把内部状态、trace、归因不确定性或异常原文转发给运营。页面读取、暂停复核、重试和消息长度处理属于实现层，agent 只调用入口并解读审计。
+通知先按店铺展示低 ROI 巡检结果，最后集中发送“暂停操作汇总”。“待暂停”是该轮筛选出的完整执行清单，“已暂停”是最终核验确认停用的子集，不把失败数或剩余数称作待暂停；不再使用“推广未暂停”及其计数。使用 `# / ## / ###` 层级和绿色已暂停、橙色待暂停、灰色指标，零值隐藏。候选保留在待暂停阶段，核验成功的同时出现在已暂停阶段，便于对照。没有候选时明确说明。技术错误、trace 和归因信息只保存在本地审计。
 
-可以用 `--config <文件>`、`--audit-dir <目录>` 指定本地配置和结果位置；读取重试和命令超时可通过环境变量调整。写入暂停不会自动重试，发生不确定结果时应先查看审计和当前页面状态。
+可以用 `--config <文件>`、`--audit-dir <目录>` 指定本地配置和结果位置。异常时 runner 保存 `awaiting-agent` 并延后通知；当前 agent 依照 [异常恢复](references/recovery.md) 诊断、只读核验，再在符合条件时重试，最后 finalize。直接在终端无人接管地运行 runner 不会自行产生一个模型进程；Codex 自动化通过读取 Skill 完成接管。
 
-执行结果保存到 `audit/<runId>.json`，包含店铺结果、低 ROI 清单、暂停结论、异常和通知状态；运行中的检查点与暂停状态也保存在 `audit/`。发现未完成的 `execute` 检查点时程序会停止，避免跨进程重复写入；失败后先查看审计和当前计划状态，不要直接重跑整个 `execute`。
+执行结果保存到 `audit/<runId>.json`，包括配置快照、店铺结果、原始待暂停清单、最终核验、异常、恢复预算和通知状态。`state.json` 持久保存待核验操作，后续轮次按推广计划隔离写入；`runner.lock` 防止同一审计目录并发执行。未完成 execute 通过 recover 恢复，不直接重跑。同一计划写入异常后停止该计划后续写入，同店其他计划继续串行处理；只有最新核验能决定已暂停集合。
 
 ## 验证与分享
 
@@ -102,6 +107,8 @@ npm pack --ignore-scripts
 ```
 
 `node --test` 用模拟 OpenCLI 和页面验证流程与边界，不会读取店铺或发消息。`check` 只检查本地依赖、配置、适配器一致性和环境变量是否存在，不验证 Browser Bridge 在线状态、登录态或页面 API 兼容性。
+
+运行时会把登录页、未登录和会话过期识别为 profile 级不可重试错误：该店铺停止后续扫描重试、暂停写入和重复回查，保留待核验审计；重新登录后再使用恢复入口。普通页面未就绪、网络和超时错误仍按有限次数处理。
 
 `npm pack` 依据 `package.json.files` 白名单生成可分享 `.tgz`；包名为 `qianniu-promotion-monitor-1.0.0.tgz`。该白名单不包含 `config.json`、`audit/`、`.env`、备份、浏览器 profile 或构建产物。分享通用包即可，收件人自行配置店铺和通知。
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseArgs, run, selectCampaigns, splitMessages, validateConfig, buildMessages } from '../runner.mjs';
+import { isAuthenticationError, parseArgs, run, selectCampaigns, splitMessages, validateConfig, buildMessages } from '../runner.mjs';
 
 const thresholds = { notifyRoiBelow: 2, closeChargeAbove: 30, closeRoiBelow: 1.5 };
 const identities = [
@@ -29,12 +29,51 @@ function setup(t, mode = 'report', config = configFor()) {
 }
 const envWithWebhook = { WECHAT_WEBHOOK_URL: 'https://example.invalid/never-contacted' };
 const option = (args, name) => args[args.indexOf(name) + 1];
+const optionalOption = (args, name) => {
+  const index = args.indexOf(name);
+  return index < 0 ? undefined : args[index + 1];
+};
+
+function targetsFrom(args) {
+  const raw = optionalOption(args, '--targets');
+  return raw === undefined ? undefined : JSON.parse(raw);
+}
+
+function verification(identity, target, outcome = 'active', overrides = {}) {
+  const status = outcome === 'inactive'
+    ? { displayStatus: 'pause', onlineStatus: 0 }
+    : outcome === 'active'
+      ? { displayStatus: 'start', onlineStatus: 1 }
+      : { displayStatus: null, onlineStatus: null };
+  return {
+    recordType: 'verification', shopName: identity.expectedAlimamaShop,
+    promotionType: target.promotionType, campaignId: target.campaignId, campaignName: target.campaignName,
+    outcome, verified: outcome === 'active' || outcome === 'inactive', roi: 1, charge: 40,
+    ...status, ...overrides,
+  };
+}
+
+function verificationResult(identity, targets, outcome = 'active', overrides = {}) {
+  return [{ recordType: 'identity', shopName: identity.expectedAlimamaShop },
+    ...targets.map((target, index) => {
+      const value = typeof outcome === 'function' ? outcome(target, index) : outcome;
+      return verification(identity, target, typeof value === 'string' ? value : value.outcome,
+        typeof value === 'string' ? overrides : value);
+    })];
+}
 
 test('default invocation is local report and validates arguments', () => {
   assert.equal(parseArgs([]).mode, 'report');
   assert.equal(parseArgs(['--mode=execute']).mode, 'execute');
   assert.throws(() => parseArgs(['--mode', 'unknown']));
   assert.throws(() => parseArgs(['--unexpected']));
+});
+
+test('authentication errors are terminal while ordinary browser errors remain retryable', () => {
+  assert.equal(isAuthenticationError(new Error('Authentication required: Alimama login page is active')), true);
+  assert.equal(isAuthenticationError(new Error('登录态已失效')), true);
+  assert.equal(isAuthenticationError(new Error('OpenCLI exited with status 75')), false);
+  assert.equal(isAuthenticationError(new Error('Campaign list is not ready')), false);
 });
 
 test('configuration allows one or many shops but rejects missing identity and whitelist violations', () => {
@@ -114,15 +153,17 @@ test('dry-run sends only after every shop has finished and never pauses', async 
       assert.ok(Buffer.byteLength(content) <= 4000);
     },
   });
-  assert.deepEqual(events.slice(0, 3), ['alpha', 'beta', 'notify']);
+  assert.deepEqual(events, ['alpha', 'beta', 'notify', 'notify']);
   assert.equal(result.notification.status, 'sent');
+  assert.equal(result.notification.sent, 2);
   assert.equal(result.closeResults.length, 0);
   const notification = notifications.join('\n');
   assert.match(notification, /^# 千牛推广巡检提醒/m);
   assert.match(notification, /^## 示例甲/m);
   assert.match(notification, /^## 示例乙/m);
-  assert.match(notification, /<font color="warning">建议暂停<\/font>/);
-  assert.doesNotMatch(notification, /推广已暂停|推广未暂停/);
+  assert.match(notifications[1], /^# 暂停操作汇总/);
+  assert.match(notification, /<font color="warning">待暂停<\/font>/);
+  assert.doesNotMatch(notification, /已暂停|推广未暂停|建议暂停/);
 });
 
 test('execute summaries show only non-zero pause outcomes and explain an empty action list', () => {
@@ -133,33 +174,38 @@ test('execute summaries show only non-zero pause outcomes and explain an empty a
     shops: [{ profile: identity.profile, browserUser: identity.browserUser, ok: true }],
     lowRoi: [row], pauseReadbacks: [], failures: [],
   };
-  const completed = buildMessages({ ...base, toClose: [row], closeResults: [{ ...row, verified: true }] }, configFor([identity])).join('\n');
-  assert.match(completed, /推广已暂停 1 个/);
-  assert.doesNotMatch(completed, /推广未暂停\s*0\s*个/);
+  const completed = buildMessages({ ...base, toClose: [row], closeResults: [{ ...row, verified: true, afterStatus: 'pause' }] }, configFor([identity])).join('\n');
+  assert.match(completed, /待暂停 1 个/);
+  assert.match(completed, /已暂停 1 个/);
+  assert.doesNotMatch(completed, /(?:待暂停|已暂停)\s*0\s*个|推广未暂停/);
 
   const unpaused = buildMessages({ ...base, toClose: [row], closeResults: [] }, configFor([identity])).join('\n');
-  assert.match(unpaused, /推广未暂停 1 个/);
-  assert.doesNotMatch(unpaused, /推广已暂停\s*0\s*个/);
+  assert.match(unpaused, /待暂停 1 个/);
+  assert.match(unpaused, /待核验/);
+  assert.doesNotMatch(unpaused, /已暂停\s*0\s*个|### 已暂停|推广未暂停/);
 
   const second = { ...row, campaignId: 'second-plan', campaignName: '示例计划 B' };
   const mixed = buildMessages({ ...base, scanned: 2, lowRoi: [row, second], toClose: [row, second],
-    closeResults: [{ ...row, verified: true }] }, configFor([identity])).join('\n');
-  assert.match(mixed, /推广已暂停 1 个/);
-  assert.match(mixed, /推广未暂停 1 个/);
+    closeResults: [{ ...row, verified: true, afterStatus: 'pause' }] }, configFor([identity])).join('\n');
+  assert.match(mixed, /已暂停 1 个/);
+  assert.match(mixed, /待暂停 2 个/);
 
   const empty = buildMessages({ ...base, lowRoi: [], toClose: [], closeResults: [] }, configFor([identity])).join('\n');
   assert.match(empty, /本次无符合暂停条件的推广/);
-  assert.doesNotMatch(empty, /推广(?:已暂停|未暂停)\s*0\s*个/);
+  assert.doesNotMatch(empty, /(?:待暂停|已暂停)\s*0\s*个|推广未暂停|# 暂停操作汇总/);
 });
 
-test('execute supplies current identity and thresholds; uncertain writes receive one final shop read-back', async t => {
+test('execute supplies current identity and thresholds; unresolved read-back defers notification to agent recovery', async t => {
   const events = [], pauses = [], notifications = [];
   const result = await run(setup(t, 'execute'), {
     env: envWithWebhook, log() {},
     callOpencli(args) {
       const identity = identities.find(row => row.profile === args[1]);
       events.push(`${args[3]}:${identity.profile}`);
-      if (args[3] === 'scan-campaigns') return scanResult(identity);
+      if (args[3] === 'scan-campaigns') {
+        const targets = targetsFrom(args);
+        return targets ? verificationResult(identity, targets, 'active') : scanResult(identity);
+      }
       pauses.push(identity.profile);
       assert.equal(option(args, '--expected-shop'), identity.expectedAlimamaShop);
       assert.equal(option(args, '--expected-name'), '示例计划');
@@ -176,21 +222,56 @@ test('execute supplies current identity and thresholds; uncertain writes receive
   });
   assert.deepEqual(pauses, ['alpha', 'beta']);
   assert.deepEqual(events, ['scan-campaigns:alpha', 'scan-campaigns:beta', 'pause-campaign:alpha',
-    'pause-campaign:beta', 'scan-campaigns:beta', 'notify']);
+    'pause-campaign:beta', 'scan-campaigns:beta']);
   assert.equal(result.closeResults.length, 1);
   assert.equal(result.closeResults[0].profile, 'alpha');
   assert.equal(result.pauseReadbacks.length, 1);
   assert.equal(result.pauseReadbacks[0].campaigns[0].outcome, 'active');
   assert.equal(result.failures[0].type, 'pause');
-  const notification = notifications.join('\n');
-  const alphaSection = notification.split('## 示例甲')[1].split('## 示例乙')[0];
-  const betaSection = notification.split('## 示例乙')[1];
-  assert.match(alphaSection, /<font color="info">推广已暂停<\/font>/);
-  assert.doesNotMatch(alphaSection, /<font color="warning">推广未暂停<\/font>/);
-  assert.match(betaSection, /<font color="warning">推广未暂停<\/font>/);
-  assert.doesNotMatch(betaSection, /<font color="info">推广已暂停<\/font>/);
+  assert.equal(result.notification.status, 'awaiting-agent');
+  assert.equal(result.notification.sent, 0);
+  assert.equal(result.recovery.status, 'awaiting-agent');
+  assert.deepEqual(result.recovery.unresolved, [{ profile: 'beta', promotionType: '全站推', campaignId: 'shared-id', type: 'active' }]);
+  assert.deepEqual(notifications, []);
+  const notification = buildMessages(result, configFor()).join('\n');
+  const operationSummary = notification.split('# 暂停操作汇总')[1];
+  const alphaSection = operationSummary.split('## 示例甲')[1].split('## 示例乙')[0];
+  const betaSection = operationSummary.split('## 示例乙')[1];
+  assert.match(alphaSection, /<font color="info">已暂停<\/font>/);
+  assert.match(alphaSection, /<font color="warning">待暂停<\/font>/);
+  assert.match(betaSection, /<font color="warning">待暂停<\/font>/);
+  assert.match(betaSection, /仍在推广/);
+  assert.doesNotMatch(betaSection, /<font color="info">已暂停<\/font>/);
   assert.match(notification, /<font color="comment">全站推｜花费 40\.00｜ROI 1\.00｜ID shared-id<\/font>/);
-  assert.doesNotMatch(notification, /uncertain write|not-in-active-list|当前不活动|未归因|归因|待停止计划|最终核验/);
+  assert.doesNotMatch(notification, /uncertain write|not-in-active-list|当前不活动|未归因|归因|待停止计划|推广未暂停/);
+});
+
+test('a lost login stops retries and all later writes for that profile', async t => {
+  const identity = identities[0];
+  const first = campaign(identity, { campaignId: 'auth-first', campaignName: '认证计划 A' });
+  const second = campaign(identity, { campaignId: 'auth-second', campaignName: '认证计划 B' });
+  const events = [];
+  const result = await run(setup(t, 'execute', configFor([identity])), {
+    env: envWithWebhook, log() {},
+    callOpencli(args) {
+      events.push(args[3]);
+      if (args[3] === 'scan-campaigns') {
+        assert.equal(targetsFrom(args), undefined);
+        return [{ recordType: 'identity', shopName: identity.expectedAlimamaShop }, first, second];
+      }
+      throw new Error('Authentication required: Alimama login page is active');
+    },
+    send() { assert.fail('lost login must defer notification until recovery'); },
+  });
+  assert.deepEqual(events, ['scan-campaigns', 'pause-campaign']);
+  assert.deepEqual(result.pauseAttempts.map(row => row.campaignId), ['auth-first']);
+  assert.deepEqual(result.pauseAttempts.map(row => row.status), ['uncertain']);
+  assert.equal(result.pauseReadbacks.length, 1);
+  assert.deepEqual(result.pauseReadbacks[0].campaigns.map(row => row.outcome), ['unverified', 'unverified']);
+  assert.equal(result.notification.status, 'awaiting-agent');
+  assert.equal(result.recovery.status, 'awaiting-agent');
+  assert.deepEqual(result.recovery.unresolved.map(row => row.campaignId), ['auth-first', 'auth-second']);
+  assert.ok(result.failures.every(row => row.reason === 'auth-required'));
 });
 
 test('an accepted pause followed by a timeout is reported as paused when the final complete scan proves inactivity', async t => {
@@ -204,17 +285,16 @@ test('an accepted pause followed by a timeout is reported as paused when the fin
       events.push(args[3]);
       if (args[3] === 'scan-campaigns') {
         scans++;
-        return scans === 1
-          ? scanResult(identity)
-          : [{ recordType: 'identity', shopName: identity.expectedAlimamaShop }];
+        const targets = targetsFrom(args);
+        return targets ? verificationResult(identity, targets, 'inactive') : scanResult(identity);
       }
       pauses++;
       throw new Error('response timed out after the server accepted the write');
     },
-    send(_url, content) { notifications.push(content); },
+    send(_url, content) { events.push('notify'); notifications.push(content); },
   });
 
-  assert.deepEqual(events, ['scan-campaigns', 'pause-campaign', 'scan-campaigns']);
+  assert.deepEqual(events, ['scan-campaigns', 'pause-campaign', 'scan-campaigns', 'notify', 'notify']);
   assert.equal(pauses, 1);
   assert.equal(result.closeResults.length, 1);
   assert.equal(result.closeResults[0].verificationSource, 'final-readback');
@@ -222,11 +302,17 @@ test('an accepted pause followed by a timeout is reported as paused when the fin
   assert.equal(result.pauseReadbacks[0].campaigns[0].outcome, 'inactive');
   const state = JSON.parse(fs.readFileSync(path.join(options.auditDir, 'state.json'), 'utf8'));
   assert.equal(state.paused['alpha|全站推|shared-id'].result.verificationSource, 'final-readback');
-  assert.match(notifications.join('\n'), /<font color="info">推广已暂停<\/font>/);
-  assert.doesNotMatch(notifications.join('\n'), /<font color="warning">推广未暂停<\/font>/);
+  assert.equal(result.notification.status, 'sent');
+  assert.equal(result.notification.sent, 2);
+  assert.deepEqual(state.pending, {});
+  assert.match(notifications[0], /^# 千牛推广执行结果/);
+  assert.match(notifications[1], /^# 暂停操作汇总/);
+  assert.match(notifications.join('\n'), /<font color="info">已暂停<\/font>/);
+  assert.match(notifications.join('\n'), /待暂停 1 个/);
+  assert.doesNotMatch(notifications.join('\n'), /推广未暂停|response timed out|server accepted/);
 });
 
-test('one combined final read-back per shop keeps active plans unpaused and displays fresh metrics', async t => {
+test('uncertain writes preserve per-campaign read-back and improved metrics', async t => {
   const identity = identities[0];
   const initial = [
     { recordType: 'identity', shopName: identity.expectedAlimamaShop },
@@ -243,7 +329,16 @@ test('one combined final read-back per shop keeps active plans unpaused and disp
   const result = await run(setup(t, 'execute', configFor([identity])), {
     env: envWithWebhook, log() {},
     callOpencli(args) {
-      if (args[3] === 'scan-campaigns') return ++scans === 1 ? initial : current;
+      if (args[3] === 'scan-campaigns') {
+        scans++;
+        const targets = targetsFrom(args);
+        if (!targets) return initial;
+        return verificationResult(identity, targets, target => {
+          const row = current.find(item => item.recordType === 'campaign'
+            && item.promotionType === target.promotionType && item.campaignId === target.campaignId);
+          return { outcome: 'active', roi: row.roi, charge: row.charge };
+        });
+      }
       pauses++;
       throw new Error('pause command timed out before returning');
     },
@@ -252,16 +347,22 @@ test('one combined final read-back per shop keeps active plans unpaused and disp
 
   assert.equal(scans, 2);
   assert.equal(pauses, 2);
+  assert.equal(result.pauseAttempts.length, 2);
+  assert.deepEqual(result.pauseAttempts.map(row => row.campaignId), ['plan-a', 'plan-b']);
+  assert.equal(result.toClose.length, 2);
   assert.equal(result.closeResults.length, 0);
   assert.deepEqual(result.pauseReadbacks[0].campaigns.map(row => row.outcome), ['active', 'active']);
+  assert.equal(result.notification.status, 'sent');
   const notification = notifications.join('\n');
-  assert.equal((notification.match(/<font color="warning">推广未暂停<\/font>/g) || []).length, 2);
+  assert.equal((notification.match(/<font color="warning">待暂停<\/font>/g) || []).length, 2);
+  assert.equal((notification.match(/无需暂停（指标已改善）/g) || []).length, 2);
+  assert.doesNotMatch(notification, /### 已暂停|推广未暂停|pause command timed out/);
   assert.match(notification, /计划 A｜<font color="comment">全站推｜花费 104\.05｜ROI 1\.61｜ID plan-a<\/font>/);
   assert.match(notification, /计划 B｜<font color="comment">全站推｜花费 88\.09｜ROI 1\.72｜ID plan-b<\/font>/);
   assert.doesNotMatch(notification, /计划 A｜<font color="comment">全站推｜花费 41\.00｜ROI 1\.10/);
 });
 
-test('a failed final read-back remains conservatively unpaused and is not retried', async t => {
+test('a failed final read-back waits for agent recovery without notifying or repeating a write', async t => {
   const identity = identities[0];
   let scans = 0, pauses = 0;
   const notifications = [];
@@ -285,34 +386,51 @@ test('a failed final read-back remains conservatively unpaused and is not retrie
   assert.equal(result.pauseReadbacks[0].ok, false);
   assert.equal(result.pauseReadbacks[0].campaigns[0].outcome, 'unverified');
   assert.deepEqual(result.failures.map(row => row.type), ['pause', 'pause-readback']);
-  const notification = notifications.join('\n');
-  assert.match(notification, /<font color="warning">推广未暂停<\/font>/);
-  assert.doesNotMatch(notification, /read-back unavailable|pause outcome uncertain/);
+  assert.equal(result.notification.status, 'awaiting-agent');
+  assert.equal(result.recovery.status, 'awaiting-agent');
+  assert.deepEqual(result.recovery.unresolved, [{ profile: 'alpha', promotionType: '全站推', campaignId: 'shared-id', type: 'unverified' }]);
+  assert.deepEqual(notifications, []);
+  const notification = buildMessages(result, configFor([identity])).join('\n');
+  assert.match(notification, /<font color="warning">待暂停<\/font>/);
+  assert.match(notification, /待核验/);
+  assert.doesNotMatch(notification, /read-back unavailable|pause outcome uncertain|### 已暂停|推广未暂停/);
 });
 
-test('a changed campaign name in the final scan remains conservatively unpaused', async t => {
+test('a changed campaign name in the final scan requires agent recovery instead of false pause success', async t => {
   const identity = identities[0];
   let scans = 0;
+  const notifications = [];
   const result = await run(setup(t, 'execute', configFor([identity])), {
-    env: envWithWebhook, log() {}, send() {},
+    env: envWithWebhook, log() {}, send(_url, content) { notifications.push(content); },
     callOpencli(args) {
       if (args[3] === 'scan-campaigns') {
         scans++;
-        return scanResult(identity, scans === 1 ? {} : { campaignName: '另一个计划', roi: 1.8, charge: 99 });
+        const targets = targetsFrom(args);
+        return targets
+          ? verificationResult(identity, targets, 'active', { campaignName: '另一个计划', roi: 1.8, charge: 99 })
+          : scanResult(identity);
       }
       throw new Error('pause outcome uncertain');
     },
   });
 
   assert.equal(result.closeResults.length, 0);
+  assert.equal(result.pauseReadbacks[0].ok, true);
   assert.equal(result.pauseReadbacks[0].campaigns[0].outcome, 'identity-mismatch');
-  assert.ok(result.failures.some(row => row.type === 'pause-readback' && row.campaignId === 'shared-id'));
-  assert.match(buildMessages(result, configFor([identity])).join('\n'), /推广未暂停/);
+  assert.deepEqual(result.failures.map(row => row.type), ['pause']);
+  assert.equal(result.notification.status, 'awaiting-agent');
+  assert.equal(result.recovery.unresolved[0].type, 'unverified');
+  assert.deepEqual(notifications, []);
+  const notification = buildMessages(result, configFor([identity])).join('\n');
+  assert.match(notification, /待暂停/);
+  assert.match(notification, /待核验/);
+  assert.doesNotMatch(notification, /### 已暂停|另一个计划|推广未暂停/);
 });
 
 test('a shop with mismatched returned campaign identity fails independently; successful shop can still be processed', async t => {
+  const notifications = [];
   const result = await run(setup(t, 'execute'), {
-    env: envWithWebhook, log() {}, send() {},
+    env: envWithWebhook, log() {}, send(_url, content) { notifications.push(content); },
     callOpencli(args) {
       const identity = identities.find(row => row.profile === args[1]);
       if (args[3] === 'scan-campaigns') return scanResult(identity, identity.profile === 'alpha' ? { shopName: '错误店铺' } : {});
@@ -325,6 +443,9 @@ test('a shop with mismatched returned campaign identity fails independently; suc
   assert.equal(result.shops[0].ok, false);
   assert.equal(result.shops[1].ok, true);
   assert.equal(result.closeResults[0].profile, 'beta');
+  assert.equal(result.notification.status, 'awaiting-agent');
+  assert.deepEqual(result.recovery.unresolved, [{ profile: 'alpha', type: 'scan' }]);
+  assert.deepEqual(notifications, []);
   assert.match(buildMessages(result, configFor()).join(''), /本店巡检未完成/);
 });
 
@@ -348,7 +469,8 @@ test('a response missing write evidence is reconciled by read-back instead of co
     callOpencli(args) {
       if (args[3] === 'scan-campaigns') {
         scans++;
-        return scans === 1 ? scanResult(identity) : [{ recordType: 'identity', shopName: identity.expectedAlimamaShop }];
+        const targets = targetsFrom(args);
+        return targets ? verificationResult(identity, targets, 'inactive') : scanResult(identity);
       }
       pauses++;
       return { ok: true, verified: true, shopName: identity.expectedAlimamaShop, promotionType: '全站推',
@@ -395,15 +517,68 @@ test('same campaign ID under another promotion type is not treated as absent', a
   const result = await run(setup(t, 'execute', configFor([identity])), {
     env: envWithWebhook, log() {}, send() {},
     callOpencli(args) {
-      if (args[3] === 'scan-campaigns') return ++scans === 1 ? initial : current;
+      if (args[3] === 'scan-campaigns') {
+        scans++;
+        const targets = targetsFrom(args);
+        if (!targets) return initial;
+        return verificationResult(identity, targets, target => target.promotionType === '全站推'
+          ? { outcome: 'active', campaignName: '关键词计划' }
+          : { outcome: 'active' });
+      }
       pauses++;
       throw new Error('pause outcome uncertain');
     },
   });
-  assert.equal(scans, 2);
+  assert.equal(scans, 3);
   assert.equal(pauses, 2);
   assert.equal(result.closeResults.length, 0);
-  assert.deepEqual(result.pauseReadbacks[0].campaigns.map(row => row.outcome), ['identity-mismatch', 'active']);
+  assert.deepEqual(result.pauseReadbacks.flatMap(readback => readback.campaigns.map(row => row.outcome)),
+    ['identity-mismatch', 'active']);
+  assert.equal(result.notification.status, 'awaiting-agent');
+  assert.deepEqual(result.recovery.unresolved.map(row => row.type), ['unverified', 'active']);
+});
+
+test('an uncertain write blocks only that campaign while other campaigns still pause', async t => {
+  const options = setup(t, 'execute');
+  const events = [], notifications = [];
+  const result = await run(options, {
+    env: envWithWebhook, log() {},
+    callOpencli(args) {
+      const identity = identities.find(row => row.profile === args[1]);
+      if (args[3] === 'scan-campaigns') {
+        events.push(`scan:${identity.profile}`);
+        const targets = targetsFrom(args);
+        if (targets) return verificationResult(identity, targets, 'active');
+        return identity.profile === 'alpha'
+          ? [{ recordType: 'identity', shopName: identity.expectedAlimamaShop },
+            campaign(identity, { campaignId: 'first', campaignName: '第一个计划' }),
+            campaign(identity, { campaignId: 'second', campaignName: '第二个计划' })]
+          : scanResult(identity);
+      }
+      const campaignId = option(args, '--campaign-id');
+      events.push(`pause:${identity.profile}:${campaignId}`);
+      if (identity.profile === 'alpha' && campaignId === 'first') throw new Error('uncertain first write');
+      return { ok: true, verified: true, writeAttempted: true, afterStatus: 'pause',
+        shopName: identity.expectedAlimamaShop, promotionType: '全站推', campaignId,
+        campaignName: campaignId === 'second' ? '第二个计划' : '示例计划' };
+    },
+    send(_url, content) { notifications.push(content); },
+  });
+  assert.deepEqual(events, ['scan:alpha', 'scan:beta', 'pause:alpha:first', 'pause:alpha:second',
+    'pause:beta:shared-id', 'scan:alpha']);
+  assert.deepEqual(result.toClose.map(row => row.campaignId), ['first', 'second', 'shared-id']);
+  assert.deepEqual(result.pauseAttempts.map(row => [row.profile, row.campaignId, row.status]),
+    [['alpha', 'first', 'uncertain'], ['alpha', 'second', 'verified'], ['beta', 'shared-id', 'verified']]);
+  assert.deepEqual(result.closeResults.map(row => [row.profile, row.campaignId]), [['alpha', 'second'], ['beta', 'shared-id']]);
+  assert.deepEqual(result.pauseReadbacks[0].campaigns.map(row => [row.campaignId, row.outcome]),
+    [['first', 'active']]);
+  assert.equal(result.notification.status, 'awaiting-agent');
+  assert.deepEqual(notifications, []);
+  const state = JSON.parse(fs.readFileSync(path.join(options.auditDir, 'state.json'), 'utf8'));
+  assert.equal(state.pending['alpha|全站推|first'].runId, result.runId);
+  assert.equal(state.pending['alpha|全站推|second'], undefined);
+  assert.equal(state.paused['beta|全站推|shared-id'].result.verified, true);
+  assert.equal(state.paused['alpha|全站推|second'].result.verified, true);
 });
 
 test('notification failures are saved without repeating scans or sends and never include the webhook', async t => {
@@ -457,15 +632,19 @@ test('styled shop messages split without losing context, plan rows, or balanced 
     mode: 'execute', scanned: rows.length,
     shops: [{ profile: identity.profile, browserUser: identity.browserUser, ok: true }],
     lowRoi: rows, toClose,
-    closeResults: toClose.slice(0, 3).map(row => ({ ...row, verified: true })),
+    closeResults: toClose.slice(0, 3).map(row => ({ ...row, verified: true, afterStatus: 'pause' })),
     failures: [{ profile: identity.profile, type: 'pause', message: 'failure-secret-must-not-render' }],
   };
   const messages = buildMessages(payload, configFor([identity]));
   assert.ok(messages.length > 1);
   const notification = messages.join('\n');
+  const firstOperation = messages.findIndex(content => content.startsWith('# 暂停操作汇总'));
+  assert.ok(firstOperation > 0);
+  assert.ok(messages.slice(0, firstOperation).every(content => content.startsWith('# 千牛推广执行结果')));
+  assert.ok(messages.slice(firstOperation).every(content => content.startsWith('# 暂停操作汇总')));
   for (const content of messages) {
     assert.ok(Buffer.byteLength(content, 'utf8') <= 4000);
-    assert.match(content, /^# 千牛推广执行结果/m);
+    assert.match(content, /^# (?:千牛推广执行结果|暂停操作汇总)/m);
     assert.match(content, /^## 示例甲/m);
     assert.doesNotMatch(content, /\uFFFD/);
     assert.equal((content.match(/<font color="(?:info|warning|comment)">/g) || []).length,
@@ -475,8 +654,17 @@ test('styled shop messages split without losing context, plan rows, or balanced 
       assert.match(line, /<\/font>$/);
     }
   }
-  for (const row of rows) assert.equal(notification.split(`ID ${row.campaignId}</font>`).length - 1, 1);
-  assert.match(notification, /<font color="info">推广已暂停<\/font>/);
-  assert.match(notification, /<font color="warning">推广未暂停<\/font>/);
-  assert.doesNotMatch(notification, /failure-secret-must-not-render|当前不活动|未归因|归因/);
+  const waitingLines = messages.flatMap(content => content.split('\n')).filter(line => line.startsWith('- <font color="warning">待暂停</font>'));
+  const pausedLines = messages.flatMap(content => content.split('\n')).filter(line => line.startsWith('- <font color="info">已暂停</font>'));
+  for (const row of rows) {
+    const wasPaused = toClose.slice(0, 3).includes(row);
+    assert.equal(notification.split(`ID ${row.campaignId}</font>`).length - 1, wasPaused ? 2 : 1);
+  }
+  for (const row of toClose) assert.equal(waitingLines.filter(line => line.includes(`ID ${row.campaignId}</font>`)).length, 1);
+  for (const row of toClose.slice(0, 3)) assert.equal(pausedLines.filter(line => line.includes(`ID ${row.campaignId}</font>`)).length, 1);
+  assert.equal(waitingLines.length, 6);
+  assert.equal(pausedLines.length, 3);
+  assert.match(notification, /待暂停 6 个/);
+  assert.match(notification, /已暂停 3 个/);
+  assert.doesNotMatch(notification, /failure-secret-must-not-render|当前不活动|未归因|归因|推广未暂停/);
 });

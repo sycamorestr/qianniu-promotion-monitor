@@ -2,16 +2,50 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { buildMessages } from './messages.mjs';
+export { buildMessages, splitMessages, splitShopMessages } from './messages.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const promotionTypes = new Set(['全站推', '关键词推广']);
 const defaults = { notifyRoiBelow: 2, closeChargeAbove: 30, closeRoiBelow: 1.5 };
 
+// Authentication failures are terminal for the current browser profile. Retrying a
+// command cannot recreate an expired login session and only adds noise or load. Keep
+// this matcher deliberately narrow; a generic page/API failure must remain retryable.
+const authenticationErrorPatterns = [
+  /logged[- ]?in shop identity is unavailable/i,
+  /(?:authentication|authorization|login|sign[- ]?in) required/i,
+  /not logged[- ]?in/i,
+  /(?:login|session|cookie).*(?:expired|invalid|失效|过期)/i,
+  /(?:未登录|未登陆|登录(?:态)?(?:已)?(?:过期|失效)|登陆(?:态)?(?:已)?(?:过期|失效)|会话(?:已)?(?:过期|失效)|认证失败)/,
+  /\b401\b/,
+  /(?:passport|login)\.(?:taobao|tmall|alimama)\./i,
+];
+
+export function isAuthenticationError(error) {
+  if (error?.code === 'AUTH_REQUIRED' || error?.authRequired === true) return true;
+  const message = String(error?.message || error || '');
+  return authenticationErrorPatterns.some(pattern => pattern.test(message));
+}
+
+function opencliFailure(message, diagnostics = '') {
+  const error = new Error(message);
+  if (authenticationErrorPatterns.some(pattern => pattern.test(String(diagnostics)))) {
+    error.code = 'AUTH_REQUIRED';
+    error.authRequired = true;
+    error.retryable = false;
+    error.message = 'OpenCLI reports that the Alimama login session is unavailable; sign in again before retrying';
+  }
+  return error;
+}
+
 export function parseArgs(args) {
   const options = { mode: 'report', configPath: path.join(root, 'config.json'), auditDir: path.join(root, 'audit') };
-  const keys = { '--mode': 'mode', '--config': 'configPath', '--audit-dir': 'auditDir' };
+  const keys = { '--mode': 'mode', '--config': 'configPath', '--audit-dir': 'auditDir',
+    '--recover': 'recover', '--finalize': 'finalize', '--settled-profiles': 'settledProfiles' };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--help') return { help: true };
+    if (args[i] === '--retry-pauses') { options.retryPauses = true; continue; }
     const [flag, ...rest] = args[i].split('=');
     if (!keys[flag]) throw new Error(`Unknown argument: ${flag}`);
     const value = rest.length ? rest.join('=') : args[++i];
@@ -19,6 +53,11 @@ export function parseArgs(args) {
     options[keys[flag]] = value;
   }
   if (!['report', 'dry-run', 'execute'].includes(options.mode)) throw new Error('mode must be report, dry-run, or execute');
+  if (options.recover && options.finalize) throw new Error('Choose recover or finalize');
+  if ((options.retryPauses || options.settledProfiles) && !options.recover) throw new Error('Retry options require --recover');
+  for (const id of [options.recover, options.finalize].filter(Boolean)) {
+    if (!/^[\w-]+$/.test(id)) throw new Error('Invalid audit run ID');
+  }
   options.configPath = path.resolve(options.configPath);
   options.auditDir = path.resolve(options.auditDir);
   return options;
@@ -68,17 +107,31 @@ export function resolveOpencli(env = process.env, platform = process.platform) {
     : { command: binary, prefix: [] };
 }
 
-function createOpencli(env) {
+export const minimumOpencliOuterTimeoutMs = commandSeconds => (commandSeconds * 2 + 60) * 1000;
+
+export function validateOpencliTimeoutBudget(timeout, commandSeconds) {
+  if (!Number.isFinite(commandSeconds) || commandSeconds < 1 || timeout < minimumOpencliOuterTimeoutMs(commandSeconds)) {
+    throw new Error('OPENCLI_TIMEOUT_MS must cover two command/failure-evidence timeouts plus 60 seconds of shutdown headroom');
+  }
+}
+
+export function createOpencli(env) {
   const launch = resolveOpencli(env);
-  const timeout = Number(env.OPENCLI_TIMEOUT_MS || 120000);
+  const timeout = Number(env.OPENCLI_TIMEOUT_MS || 420000);
   if (!Number.isFinite(timeout) || timeout < 1000) throw new Error('OPENCLI_TIMEOUT_MS must be at least 1000');
   return args => {
+    const timeoutIndex = args.indexOf('--timeout');
+    if (timeoutIndex >= 0) {
+      const commandSeconds = Number(args[timeoutIndex + 1]);
+      validateOpencliTimeoutBudget(timeout, commandSeconds);
+    }
     const proc = spawnSync(launch.command, [...launch.prefix, ...args], {
       encoding: 'utf8', timeout, env, windowsHide: true, maxBuffer: 32 * 1024 * 1024,
     });
     // Do not copy browser traces or arbitrary stderr (which may contain session data) into audit files.
-    if (proc.error) throw new Error(`OpenCLI process failed (${proc.error.code || 'unknown'}); inspect its local trace`);
-    if (proc.status !== 0) throw new Error(`OpenCLI exited with status ${proc.status}; inspect its local trace`);
+    const diagnostics = `${proc.stdout || ''}\n${proc.stderr || ''}`;
+    if (proc.error) throw opencliFailure(`OpenCLI process failed (${proc.error.code || 'unknown'}); inspect its local trace`, diagnostics);
+    if (proc.status !== 0) throw opencliFailure(`OpenCLI exited with status ${proc.status}; inspect its local trace`, diagnostics);
     try { return JSON.parse(proc.stdout); }
     catch { throw new Error('OpenCLI returned invalid JSON'); }
   };
@@ -99,8 +152,46 @@ export function validateScan(rows, identity) {
   });
 }
 
-const active = row => row.displayStatus === 'start' && row.onlineStatus === 1;
-const keyOf = row => `${row.profile}|${row.promotionType}|${row.campaignId}`;
+export function validateVerification(rows, identity, targets) {
+  if (!Array.isArray(rows) || rows.filter(row => row?.recordType === 'identity').length !== 1
+      || rows.find(row => row?.recordType === 'identity').shopName !== identity.expectedAlimamaShop) {
+    throw new Error('Shop identity mismatch in target verification');
+  }
+  const observations = rows.filter(row => row.recordType !== 'identity');
+  if (observations.length !== targets.length) throw new Error('Target verification is incomplete');
+  return targets.map(target => {
+    const matches = observations.filter(row => row.promotionType === target.promotionType
+      && String(row.campaignId) === target.campaignId);
+    if (matches.length !== 1) throw new Error('Target verification identity mismatch');
+    const row = matches[0];
+    if (row.recordType !== 'verification' || row.shopName !== identity.expectedAlimamaShop) throw new Error('Invalid target verification');
+    const nameMatches = row.campaignName === target.campaignName;
+    const inactive = nameMatches && row.verified === true && row.outcome === 'inactive'
+      && row.displayStatus === 'pause' && row.onlineStatus === 0;
+    const isActive = nameMatches && row.verified === true && row.outcome === 'active' && active(row);
+    return { ...target, ...row, profile: identity.profile, browserUser: identity.browserUser,
+      outcome: inactive ? 'inactive' : isActive ? 'active' : nameMatches ? 'unverified' : 'identity-mismatch',
+      verified: inactive || isActive };
+  });
+}
+
+export const targetArgs = rows => ['--targets', JSON.stringify(rows.map(row => ({ promotionType: row.promotionType,
+  campaignId: row.campaignId, campaignName: row.campaignName })))];
+
+export const targetGroups = rows => ['全站推', '关键词推广']
+  .map(promotionType => rows.filter(row => row.promotionType === promotionType))
+  .filter(rowsOfType => rowsOfType.length);
+
+export function commandTimeoutArgs(env) {
+  const seconds = Number(env.OPENCLI_BROWSER_COMMAND_TIMEOUT || 180);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
+    throw new Error('OPENCLI_BROWSER_COMMAND_TIMEOUT must be 1..3600 seconds');
+  }
+  return ['--timeout', String(seconds)];
+}
+
+export const active = row => row.displayStatus === 'start' && row.onlineStatus === 1;
+export const keyOf = row => `${row.profile}|${row.promotionType}|${row.campaignId}`;
 export function selectCampaigns(rows, thresholds) {
   return {
     lowRoi: rows.filter(row => active(row) && Number.isFinite(row.roi) && row.roi < thresholds.notifyRoiBelow),
@@ -109,177 +200,14 @@ export function selectCampaigns(rows, thresholds) {
   };
 }
 
-function atomicJson(filePath, value) {
+export function atomicJson(filePath, value) {
   const temporary = `${filePath}.${process.pid}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(value, null, 2));
   fs.renameSync(temporary, filePath);
 }
 
-const safeText = value => String(value ?? '-').replace(/[\r\n\t]/g, ' ').replace(/[<>&`*_\[\]]/g, '');
-const metric = value => Number.isFinite(value) ? value.toFixed(2) : '-';
-const color = (name, value) => `<font color="${name}">${value}</font>`;
-const compactText = (value, maxCharacters = 80) => {
-  const characters = [...safeText(value)];
-  return characters.length <= maxCharacters ? characters.join('') : `${characters.slice(0, maxCharacters - 3).join('')}...`;
-};
-const campaignDetails = row => `${safeText(row.promotionType)}｜花费 ${metric(row.charge)}｜ROI ${metric(row.roi)}｜ID ${safeText(row.campaignId)}`;
-const pauseLine = (row, label, statusColor) => `- ${color(statusColor, label)}｜${compactText(row.campaignName)}｜${color('comment', campaignDetails(row))}`;
-const lowRoiLine = row => `- ${compactText(row.campaignName)}｜${safeText(row.promotionType)}｜花费 ${metric(row.charge)}｜ROI ${color('warning', metric(row.roi))}｜${color('comment', `ID ${safeText(row.campaignId)}`)}`;
 
-export function splitMessages(header, lines, maxBytes = 4000) {
-  if (Buffer.byteLength(header, 'utf8') > maxBytes - 8) throw new Error('Notification header too long');
-  const parts = [];
-  let current = header;
-  for (const line of lines) {
-    // Split even a single exceptionally long plan name without splitting UTF-8 code points.
-    for (const character of `\n${line}`) {
-      if (Buffer.byteLength(current + character, 'utf8') > maxBytes) {
-        parts.push(current);
-        current = `${header}\n`;
-      }
-      current += character;
-    }
-  }
-  if (current) parts.push(current);
-  return parts;
-}
-
-const appendBlock = (content, block) => `${content}\n${block}`;
-const fits = (content, maxBytes) => Buffer.byteLength(content, 'utf8') <= maxBytes;
-
-// Keep shop and subsection context intact when a large shop needs several WeCom messages.
-export function splitShopMessages(header, sections, maxBytes = 4000) {
-  if (Buffer.byteLength(header, 'utf8') > maxBytes - 8) throw new Error('Notification header too long');
-  const parts = [];
-  let current = header;
-  const flush = () => {
-    if (current !== header) parts.push(current);
-    current = header;
-  };
-  const shopPrefix = (section, continuation = false, groupHeading = '') => [
-    header,
-    continuation ? `${section.heading} ${color('comment', '（续）')}` : section.heading,
-    section.summary,
-    groupHeading,
-  ].filter(Boolean).join('\n');
-
-  for (const section of sections) {
-    const block = [section.heading, section.summary,
-      ...section.groups.flatMap(group => [group.heading, ...group.lines])].filter(Boolean).join('\n');
-    if (fits(appendBlock(current, block), maxBytes)) {
-      current = appendBlock(current, block);
-      continue;
-    }
-    if (current !== header) flush();
-    if (fits(appendBlock(header, block), maxBytes)) {
-      current = appendBlock(header, block);
-      continue;
-    }
-
-    current = shopPrefix(section);
-    if (!fits(current, maxBytes)) throw new Error('Notification shop heading is too long');
-    for (const group of section.groups) {
-      if (!group.lines.length) continue;
-      const first = `${group.heading}\n${group.lines[0]}`;
-      if (!fits(appendBlock(current, first), maxBytes)) {
-        flush();
-        current = shopPrefix(section, true);
-      }
-      if (!fits(appendBlock(current, first), maxBytes)) throw new Error('Notification line is too long for its shop context');
-      current = appendBlock(current, first);
-      for (const line of group.lines.slice(1)) {
-        if (!fits(appendBlock(current, line), maxBytes)) {
-          flush();
-          current = shopPrefix(section, true, group.heading);
-        }
-        if (!fits(appendBlock(current, line), maxBytes)) throw new Error('Notification line is too long for its shop context');
-        current = appendBlock(current, line);
-      }
-    }
-  }
-  flush();
-  return parts;
-}
-
-export function buildMessages(payload, config) {
-  const completed = payload.shops.filter(shop => shop.ok).length;
-  const failedShops = config.profiles.length - completed;
-  const verified = new Set(payload.closeResults.map(keyOf));
-  const freshActive = new Map();
-  for (const readback of payload.pauseReadbacks || []) {
-    for (const result of readback.campaigns || []) {
-      if (result.outcome === 'active' && result.current) {
-        freshActive.set(`${readback.profile}|${result.promotionType}|${result.campaignId}`, result.current);
-      }
-    }
-  }
-  const displayRow = row => ({ ...row, ...(freshActive.get(keyOf(row)) || {}) });
-  const stopped = payload.toClose.filter(row => verified.has(keyOf(row))).length;
-  const notStopped = payload.toClose.length - stopped;
-  const pauseOutcomeCounts = (paused, unpaused) => [
-    paused ? color('info', `推广已暂停 ${paused} 个`) : '',
-    unpaused ? color('warning', `推广未暂停 ${unpaused} 个`) : '',
-  ].filter(Boolean).join('｜');
-  const executeOutcome = pauseOutcomeCounts(stopped, notStopped)
-    || color('comment', failedShops ? '已完成店铺中无符合暂停条件的推广' : '本次无符合暂停条件的推广');
-  const title = payload.mode === 'execute' ? '# 千牛推广执行结果'
-    : payload.mode === 'dry-run' ? '# 千牛推广巡检提醒' : '# 千牛推广巡检报告';
-  const header = [
-    title,
-    `> 巡检完成 ${color('info', `${completed}/${config.profiles.length} 店`)}｜推广 ${payload.scanned} 个｜低 ROI ${color(payload.lowRoi.length ? 'warning' : 'info', `${payload.lowRoi.length} 个`)}`,
-    payload.mode === 'execute'
-      ? `> ${executeOutcome}`
-      : payload.mode === 'dry-run'
-        ? `> ${color('comment', '本次仅巡检，未执行暂停')}｜建议暂停 ${color('warning', `${payload.toClose.length} 个`)}`
-        : `> ${color('comment', '本次仅生成本地报告，未执行暂停')}`,
-    failedShops ? `> ${color('warning', `巡检未完成 ${failedShops} 店，请人工检查`)}` : '',
-  ].filter(Boolean).join('\n');
-
-  const sections = config.profiles.map(identity => {
-    const heading = `## ${compactText(identity.browserUser, 40)}`;
-    if (!payload.shops.find(shop => shop.profile === identity.profile)?.ok) {
-      return {
-        heading,
-        summary: `> ${color('warning', '本店巡检未完成')}`,
-        groups: [{ heading: '### 巡检结果', lines: [`- ${color('warning', '请人工检查店铺登录及页面状态')}`] }],
-      };
-    }
-
-    const lowRows = payload.lowRoi.filter(row => row.profile === identity.profile);
-    const closeRows = payload.toClose.filter(row => row.profile === identity.profile);
-    const closeKeys = new Set(closeRows.map(keyOf));
-    const groups = [];
-    if (payload.mode === 'execute' && closeRows.length) {
-      groups.push({
-        heading: '### 暂停结果',
-        lines: closeRows.map(row => verified.has(keyOf(row))
-          ? pauseLine(displayRow(row), '推广已暂停', 'info')
-          : pauseLine(displayRow(row), '推广未暂停', 'warning')),
-      });
-    } else if (payload.mode === 'dry-run' && closeRows.length) {
-      groups.push({ heading: '### 建议处理', lines: closeRows.map(row => pauseLine(row, '建议暂停', 'warning')) });
-    }
-    const shownAsPause = payload.mode === 'execute' || payload.mode === 'dry-run' ? closeKeys : new Set();
-    const otherLow = lowRows.filter(row => !shownAsPause.has(keyOf(row)));
-    if (otherLow.length) {
-      groups.push({ heading: closeRows.length && shownAsPause.size ? '### 其他低 ROI' : '### 低 ROI 推广', lines: otherLow.map(lowRoiLine) });
-    } else if (!lowRows.length) {
-      groups.push({ heading: '### 巡检结果', lines: [`- ${color('info', '暂无低 ROI 推广')}`] });
-    }
-
-    const shopStopped = closeRows.filter(row => verified.has(keyOf(row))).length;
-    const shopOutcome = pauseOutcomeCounts(shopStopped, closeRows.length - shopStopped);
-    const shopSummary = payload.mode === 'execute'
-      ? `> 低 ROI ${color(lowRows.length ? 'warning' : 'info', `${lowRows.length} 个`)}${shopOutcome ? `｜${shopOutcome}` : ''}`
-      : payload.mode === 'dry-run'
-        ? `> 低 ROI ${color(lowRows.length ? 'warning' : 'info', `${lowRows.length} 个`)}｜建议暂停 ${color('warning', `${closeRows.length} 个`)}`
-        : `> 低 ROI ${color(lowRows.length ? 'warning' : 'info', `${lowRows.length} 个`)}`;
-    return { heading, summary: shopSummary, groups };
-  });
-  return splitShopMessages(header, sections);
-}
-
-async function sendWeChat(webhook, content) {
+export async function sendWeChat(webhook, content) {
   const response = await fetch(webhook, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ msgtype: 'markdown', markdown: { content } }),
@@ -289,8 +217,37 @@ async function sendWeChat(webhook, content) {
   if ((await response.json()).errcode !== 0) throw new Error('WeCom rejected the notification');
 }
 
-// Dependencies are injectable solely for offline verification; the CLI always uses the actual OpenCLI launcher.
+// Lock audit mutations and recovery writes across processes, including notification finalization.
 export async function run(options, dependencies = {}) {
+  fs.mkdirSync(options.auditDir, { recursive: true });
+  const lockPath = path.join(options.auditDir, 'runner.lock');
+  let lock;
+  try { lock = fs.openSync(lockPath, 'wx'); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    let owner;
+    try { owner = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { /* fail closed */ }
+    if (!Number.isSafeInteger(owner?.pid) || owner.pid < 1) throw new Error('Runner lock needs agent inspection');
+    try { process.kill(owner.pid, 0); }
+    catch (probe) {
+      if (probe.code === 'ESRCH') {
+        throw new Error('Stale runner lock; agent must inspect and remove this lock before recovery');
+      }
+      throw new Error('Cannot verify runner lock owner');
+    }
+    throw new Error('Another runner is active; wait for it before recovery');
+  }
+  try {
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    return await runUnlocked(options, dependencies);
+  } finally {
+    fs.closeSync(lock);
+    fs.unlinkSync(lockPath);
+  }
+}
+
+// Dependencies are injectable solely for offline verification; the CLI always uses the actual OpenCLI launcher.
+async function runUnlocked(options, dependencies) {
   const env = dependencies.env || process.env;
   let config;
   try { config = JSON.parse(fs.readFileSync(options.configPath, 'utf8')); }
@@ -299,6 +256,10 @@ export async function run(options, dependencies = {}) {
     throw new Error(`Cannot read config file (${error.code || 'read error'})`);
   }
   config = validateConfig(config);
+  if (options.recover || options.finalize) {
+    const { recoverAudit } = await import('./recovery.mjs');
+    return recoverAudit(options, config, dependencies);
+  }
   if (!['report', 'dry-run', 'execute'].includes(options.mode)) throw new Error('Invalid mode');
   const webhook = env.WECHAT_WEBHOOK_URL;
   if (options.mode !== 'report') {
@@ -331,11 +292,22 @@ export async function run(options, dependencies = {}) {
   const state = options.mode === 'execute' && fs.existsSync(statePath)
     ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { paused: {} };
   if (!state.paused || typeof state.paused !== 'object' || Array.isArray(state.paused)) throw new Error('Invalid pause state file');
-  const results = [], failures = [], closeResults = [], pauseReadbacks = [], shops = [], seen = new Set();
+  state.pending ||= {};
+  if (typeof state.pending !== 'object' || Array.isArray(state.pending)) throw new Error('Invalid pending state file');
+  // Pending writes are isolated by promotion plan. A stale/uncertain plan must
+  // not suppress independent eligible plans from the same shop profile.
+  const blockedKeys = new Set(Object.keys(state.pending));
+  const inheritedBlockedKeys = new Set(blockedKeys);
+  const pendingRuns = [...new Set(Object.values(state.pending).map(row => row.runId).filter(Boolean))];
+  const results = [], failures = [], closeResults = [], pauseReadbacks = [], shops = [], seen = new Set(), pauseAttempts = [];
+  const authBlockedProfiles = new Set();
+  const configSnapshot = { profiles: config.profiles, allowedBrowserUsers: config.allowedBrowserUsers,
+    thresholds: config.thresholds, limits: config.limits };
   const checkpoint = current => atomicJson(checkpointPath,
-    { runId, mode: options.mode, current, results, shops, failures, closeResults, pauseReadbacks });
+    { runId, mode: options.mode, configSnapshot, current, results, shops, failures, closeResults, pauseReadbacks, pauseAttempts });
   const lifecycle = ['-f', 'json', '--window', 'background', '--site-session', 'ephemeral', '--keep-tab', 'false'];
   const pagination = ['--page-size', String(config.limits.pageSize), '--max-pages', String(config.limits.maxPages)];
+  const commandTimeout = commandTimeoutArgs(env);
 
   for (const [index, identity] of config.profiles.entries()) {
     log(`[${index + 1}/${config.profiles.length}] ${identity.browserUser}: scan`);
@@ -343,12 +315,20 @@ export async function run(options, dependencies = {}) {
     let rows, lastError;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
-        rows = validateScan(await callOpencli(['--profile', identity.profile, 'alimama', 'scan-campaigns', ...pagination, ...lifecycle]), identity);
+        rows = validateScan(await callOpencli(['--profile', identity.profile, 'alimama', 'scan-campaigns', ...pagination,
+          ...commandTimeout, '--trace', 'retain-on-failure', ...lifecycle]), identity);
         break;
-      } catch (error) { lastError = error; }
+      } catch (error) {
+        lastError = error;
+        if (isAuthenticationError(error)) {
+          authBlockedProfiles.add(identity.profile);
+          break;
+        }
+      }
     }
     shops.push({ profile: identity.profile, browserUser: identity.browserUser, ok: !!rows });
-    if (!rows) failures.push({ profile: identity.profile, browserUser: identity.browserUser, type: 'scan', message: lastError.message });
+    if (!rows) failures.push({ profile: identity.profile, browserUser: identity.browserUser, type: 'scan',
+      ...(isAuthenticationError(lastError) ? { reason: 'auth-required', retryable: false } : {}), message: lastError.message });
     else for (const row of rows) if (!seen.has(keyOf(row))) { seen.add(keyOf(row)); results.push(row); }
     checkpoint({ type: 'scan', profile: identity.profile, done: true });
   }
@@ -356,7 +336,12 @@ export async function run(options, dependencies = {}) {
   const { lowRoi, toClose } = selectCampaigns(results, config.thresholds);
   if (options.mode === 'execute') for (const row of toClose) {
     const identity = config.profiles.find(item => item.profile === row.profile);
+    if (authBlockedProfiles.has(row.profile)) continue;
+    if (blockedKeys.has(keyOf(row))) continue;
     // Persist intent before a write. An interrupted / uncertain write must be read back before any retry.
+    pauseAttempts.push({ ...row, attempt: 1, status: 'pending', sessionMode: 'persistent', at: new Date().toISOString() });
+    state.pending[keyOf(row)] = { ...row, runId, attempts: 1, status: 'pending' };
+    atomicJson(statePath, state);
     checkpoint({ type: 'pause', profile: row.profile, promotionType: row.promotionType, campaignId: row.campaignId, status: 'pending' });
     try {
       const raw = await callOpencli(['--profile', row.profile, 'alimama', 'pause-campaign',
@@ -364,7 +349,7 @@ export async function run(options, dependencies = {}) {
         '--campaign-id', row.campaignId, '--expected-shop', identity.expectedAlimamaShop,
         '--expected-name', row.campaignName, '--max-roi', String(config.thresholds.closeRoiBelow),
         '--min-charge', String(config.thresholds.closeChargeAbove), ...pagination,
-        '--execute', '--trace', 'retain-on-failure', ...lifecycle]);
+        ...commandTimeout, '--execute', '--trace', 'retain-on-failure', ...lifecycle.map((value, index) => lifecycle[index - 1] === '--site-session' ? 'persistent' : value)]);
       const result = Array.isArray(raw) && raw.length === 1 ? raw[0] : raw;
       if (result?.ok !== true || result.verified !== true || result.shopName !== identity.expectedAlimamaShop
         || result.promotionType !== row.promotionType || String(result.campaignId) !== row.campaignId
@@ -374,11 +359,17 @@ export async function run(options, dependencies = {}) {
       }
       const verified = { ...result, profile: row.profile, browserUser: row.browserUser };
       const nextPaused = { ...state.paused, [keyOf(row)]: { at: new Date().toISOString(), runId, result: verified } };
+      delete state.pending[keyOf(row)];
       atomicJson(statePath, { ...state, paused: nextPaused });
       state.paused = nextPaused;
       closeResults.push(verified);
+      pauseAttempts.at(-1).status = 'verified';
     } catch (error) {
-      failures.push({ profile: row.profile, browserUser: row.browserUser, type: 'pause', campaignId: row.campaignId, message: error.message });
+      pauseAttempts.at(-1).status = 'uncertain';
+      if (isAuthenticationError(error)) authBlockedProfiles.add(row.profile);
+      blockedKeys.add(keyOf(row));
+      failures.push({ profile: row.profile, browserUser: row.browserUser, type: 'pause', campaignId: row.campaignId,
+        ...(isAuthenticationError(error) ? { reason: 'auth-required', retryable: false } : {}), message: error.message });
     }
     checkpoint({ type: 'pause', profile: row.profile, campaignId: row.campaignId, done: true });
   }
@@ -394,138 +385,98 @@ export async function run(options, dependencies = {}) {
 
     for (const [profile, pending] of pendingByProfile) {
       const identity = config.profiles.find(item => item.profile === profile);
-      const readback = {
-        profile,
-        browserUser: identity.browserUser,
-        expectedAlimamaShop: identity.expectedAlimamaShop,
-        ok: false,
-        campaigns: [],
-      };
-      log(`${identity.browserUser}: final pause read-back`);
-      checkpoint({ type: 'pause-readback', profile, status: 'pending' });
-      try {
-        // One complete read-only scan resolves every uncertain candidate in this shop. Never replay a pause write.
-        const currentRows = validateScan(await callOpencli([
-          '--profile', profile, 'alimama', 'scan-campaigns', ...pagination, ...lifecycle,
-        ]), identity);
-        readback.ok = true;
-        readback.activeCampaignCount = currentRows.length;
-        const nextPaused = { ...state.paused };
-        const verifiedResults = [];
-        for (const row of pending) {
-          const sameId = currentRows.filter(current => current.campaignId === row.campaignId);
-          const matches = currentRows.filter(current => keyOf(current) === keyOf(row));
-          if (matches.length === 0) {
-            if (sameId.length) {
-              readback.campaigns.push({
-                promotionType: row.promotionType,
-                campaignId: row.campaignId,
-                expectedCampaignName: row.campaignName,
-                outcome: 'identity-mismatch',
-                verified: false,
-                current: null,
-              });
-              failures.push({
-                profile,
-                browserUser: identity.browserUser,
-                type: 'pause-readback',
-                campaignId: row.campaignId,
-                message: 'Campaign promotion type changed during pause read-back',
-              });
-              continue;
-            }
-            const verifiedResult = {
-              ...row,
-              ok: true,
-              verified: true,
-              shopName: identity.expectedAlimamaShop,
-              beforeStatus: 'unknown',
-              afterStatus: 'not-in-active-list',
-              writeAttempted: null,
-              verificationSource: 'final-readback',
-              message: 'verified inactive by complete final read-back',
-            };
-            nextPaused[keyOf(row)] = { at: new Date().toISOString(), runId, result: verifiedResult };
-            verifiedResults.push(verifiedResult);
-            readback.campaigns.push({
-              promotionType: row.promotionType,
-              campaignId: row.campaignId,
-              expectedCampaignName: row.campaignName,
-              outcome: 'inactive',
-              verified: true,
-              current: null,
-            });
-            continue;
-          }
-
-          const current = matches[0];
-          const currentSnapshot = {
-            campaignName: current.campaignName,
-            roi: current.roi,
-            charge: current.charge,
-            displayStatus: current.displayStatus,
-            onlineStatus: current.onlineStatus,
-          };
-          if (matches.length !== 1 || current.campaignName !== row.campaignName) {
-            readback.campaigns.push({
-              promotionType: row.promotionType,
-              campaignId: row.campaignId,
-              expectedCampaignName: row.campaignName,
-              outcome: 'identity-mismatch',
-              verified: false,
-              current: currentSnapshot,
-            });
-            failures.push({
-              profile,
-              browserUser: identity.browserUser,
-              type: 'pause-readback',
-              campaignId: row.campaignId,
-              message: matches.length !== 1
-                ? 'Pause read-back returned duplicate campaign identities'
-                : 'Campaign name changed during pause read-back',
-            });
-            continue;
-          }
-          readback.campaigns.push({
-            promotionType: row.promotionType,
-            campaignId: row.campaignId,
-            expectedCampaignName: row.campaignName,
-            outcome: 'active',
-            verified: true,
-            current: currentSnapshot,
-          });
-        }
-        if (verifiedResults.length) {
-          atomicJson(statePath, { ...state, paused: nextPaused });
-          state.paused = nextPaused;
-          closeResults.push(...verifiedResults);
-        }
-      } catch (error) {
-        readback.error = error.message;
-        readback.campaigns = pending.map(row => ({
-          promotionType: row.promotionType,
-          campaignId: row.campaignId,
-          expectedCampaignName: row.campaignName,
-          outcome: 'unverified',
-          verified: false,
-          current: null,
-        }));
-        failures.push({
+      for (const group of targetGroups(pending)) {
+        const promotionType = group[0].promotionType;
+        const readback = {
           profile,
+          promotionType,
           browserUser: identity.browserUser,
-          type: 'pause-readback',
-          message: error.message,
-        });
+          expectedAlimamaShop: identity.expectedAlimamaShop,
+          ok: false,
+          campaigns: [],
+        };
+        log(`${identity.browserUser}: final ${promotionType} pause read-back`);
+        checkpoint({ type: 'pause-readback', profile, promotionType, status: 'pending' });
+        if (authBlockedProfiles.has(profile)) {
+          readback.error = 'Login session unavailable; read-back deferred until the shop is signed in again';
+          readback.campaigns = group.map(row => ({
+            promotionType: row.promotionType, campaignId: row.campaignId, expectedCampaignName: row.campaignName,
+            outcome: 'unverified', verified: false, current: null,
+          }));
+          readback.checkedAt = new Date().toISOString();
+          pauseReadbacks.push(readback);
+          failures.push({ profile, promotionType, browserUser: identity.browserUser,
+            type: 'pause-readback', reason: 'auth-required', retryable: false, message: readback.error });
+          checkpoint({ type: 'pause-readback', profile, promotionType, done: true });
+          continue;
+        }
+        try {
+          const currentRows = validateVerification(await callOpencli([
+            '--profile', profile, 'alimama', 'scan-campaigns', ...targetArgs(group), ...pagination,
+            ...commandTimeout, '--trace', 'retain-on-failure', ...lifecycle,
+          ]), identity, group);
+          readback.ok = true;
+          for (const current of currentRows) {
+            const row = group.find(item => keyOf(item) === keyOf(current));
+            readback.campaigns.push({
+              promotionType: row.promotionType, campaignId: row.campaignId, expectedCampaignName: row.campaignName,
+              outcome: current.outcome, verified: current.verified, current,
+            });
+            if (current.outcome === 'inactive') {
+              const verifiedResult = { ...row, ok: true, verified: true, afterStatus: 'pause',
+                writeAttempted: null, verificationSource: 'final-readback' };
+              closeResults.push(verifiedResult);
+              state.paused[keyOf(row)] = { at: new Date().toISOString(), runId, result: verifiedResult };
+              delete state.pending[keyOf(row)];
+            } else if (current.outcome === 'active' && Number.isFinite(current.roi) && Number.isFinite(current.charge)
+                && !selectCampaigns([current], config.thresholds).toClose.length) {
+              delete state.pending[keyOf(row)];
+            }
+          }
+          atomicJson(statePath, state);
+        } catch (error) {
+          readback.error = error.message;
+          readback.campaigns = group.map(row => ({
+            promotionType: row.promotionType, campaignId: row.campaignId, expectedCampaignName: row.campaignName,
+            outcome: 'unverified', verified: false, current: null,
+          }));
+          failures.push({ profile, promotionType, browserUser: identity.browserUser,
+            type: 'pause-readback', message: error.message });
+        }
+        readback.checkedAt = new Date().toISOString();
+        pauseReadbacks.push(readback);
+        checkpoint({ type: 'pause-readback', profile, promotionType, done: true });
       }
-      readback.checkedAt = new Date().toISOString();
-      pauseReadbacks.push(readback);
-      checkpoint({ type: 'pause-readback', profile, done: true });
     }
   }
 
-  const payload = { runAt: new Date().toISOString(), runId, mode: options.mode, scanned: results.length,
-    shops, lowRoi, toClose, closeResults, pauseReadbacks, failures,
+  const payload = { runAt: new Date().toISOString(), runId, mode: options.mode, configSnapshot, scanned: results.length,
+    shops, lowRoi, toClose, closeResults, pauseReadbacks, failures, pauseAttempts, pendingRuns,
     notification: { status: options.mode === 'report' ? 'disabled' : 'not-needed', sent: 0 } };
+  if (options.mode !== 'report') {
+    const { unresolvedItems } = await import('./recovery.mjs');
+    const unresolved = unresolvedItems(payload, config);
+    if (options.mode === 'execute' && pendingRuns.length) {
+      unresolved.push(...pendingRuns.map(id => ({ type: 'prior-run', runId: id })));
+    }
+    if (unresolved.length) {
+      payload.recovery = { status: 'awaiting-agent', rounds: 0, unresolved };
+      payload.notification.status = 'awaiting-agent';
+      if (options.mode === 'execute') {
+        for (const row of toClose) {
+          if (inheritedBlockedKeys.has(keyOf(row))) continue;
+          if (!unresolved.some(item => item.profile === row.profile && item.campaignId === row.campaignId
+            && item.promotionType === row.promotionType)) continue;
+          state.pending[keyOf(row)] ||= { ...row, runId, status: 'awaiting-agent' };
+        }
+        atomicJson(statePath, state);
+      }
+      atomicJson(finalPath, payload);
+      fs.unlinkSync(checkpointPath);
+      log(`Agent recovery required: node runner.mjs --recover ${runId}; finalize only after recovery`);
+      return payload;
+    }
+  }
   atomicJson(finalPath, payload);
   if (options.mode !== 'report' && (lowRoi.length || toClose.length || failures.length)) {
     payload.notification.status = 'sending';
@@ -548,14 +499,18 @@ export async function run(options, dependencies = {}) {
   return payload;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+async function main() {
   try {
     const options = parseArgs(process.argv.slice(2));
-    if (options.help) console.log('node runner.mjs [--mode report|dry-run|execute] [--config FILE] [--audit-dir DIR]\nDefault: report (local results only; no notification or pause).');
+    if (options.help) console.log('node runner.mjs [--mode report|dry-run|execute] [--config FILE] [--audit-dir DIR]\nnode runner.mjs --recover RUN_ID [--retry-pauses --settled-profiles PROFILE,PROFILE]\nnode runner.mjs --finalize RUN_ID\nDefault: report. Recovery reads only unless an agent explicitly enables a guarded retry. Finalize sends saved results only.');
     else {
       const payload = await run(options);
       console.log(JSON.stringify(payload, null, 2));
-      if (payload.failures.length) process.exitCode = 1;
+      if (payload.recovery?.status === 'awaiting-agent') process.exitCode = 2;
+      else if (payload.notification.status === 'failed' || payload.recovery?.unresolved?.length
+        || (!payload.recovery && payload.failures.some(row => row.type !== 'pause'))) process.exitCode = 1;
     }
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main();
