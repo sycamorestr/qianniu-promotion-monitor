@@ -7,7 +7,6 @@ const URLS = {
 
 // This function is serialized into the existing browser page. Keep it self-contained.
 export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
-  await new Promise(resolve => setTimeout(resolve, 4000));
   const route = type === 'keyword' ? '/manage/search' : '/manage/onesite';
   const onRoute = href => {
     try {
@@ -93,7 +92,7 @@ export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
     } catch { /* Marketing-overlay dismissal is best effort; read guards remain authoritative. */ }
   };
   let view, api, submit;
-  for (let attempt = 0; attempt < 20; attempt++) {
+  {
     assertRoute();
     dismissKnownMarketingOverlay();
     let Magix;
@@ -117,8 +116,6 @@ export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
         break;
       }
     }
-    if (view) break;
-    if (attempt < 19) await new Promise(resolve => setTimeout(resolve, 500));
   }
   if (!view) throw new Error(`${type} campaign list is not ready`);
 
@@ -148,6 +145,16 @@ export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
     if (!fields.includes(field)) fields.push(field);
   }
   base.rptQuery.fields = fields.join(',');
+  // Carry the exact date/attribution context to the later write command. A
+  // persistent pause tab can retain a different day's report settings.
+  const condition = base.rptQuery.conditionList[0];
+  const reportContext = Object.fromEntries(['sourceList', 'adzonePkgIdList', 'effectEqual', 'unifyType',
+    'startTime', 'endTime', 'isRt'].filter(key => condition[key] !== undefined).map(key => [key, condition[key]]));
+
+  const query = async params => {
+    try { return await api(params); }
+    catch (error) { throw new Error(`Campaign query failed: ${error?.message || error}`); }
+  };
 
   const metric = value => {
     if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') return null;
@@ -159,7 +166,7 @@ export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
     for (const target of targets) {
       // Native onebp mxSearch uses searchKey=campaignId; mxSetParams converts it to campaignId.
       // Include both native status values so an explicitly paused row remains visible.
-      const response = await api({ ...JSON.parse(JSON.stringify(base)), statusList: ['start', 'pause'],
+      const response = await query({ ...JSON.parse(JSON.stringify(base)), statusList: ['start', 'pause'],
         campaignId: target.campaignId, offset: 0, pageSize: 2 });
       const data = response?.data;
       if (!Array.isArray(data?.list)) throw new Error('Target query did not return data.list');
@@ -180,6 +187,7 @@ export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
       rows.push({ recordType: 'verification', shopName: before.shopName,
         promotionType: type === 'keyword' ? '关键词推广' : '全站推', campaignId: target.campaignId,
         campaignName: row?.campaignName || target.campaignName, outcome, verified: outcome !== 'unverified',
+        reportContext,
         roi: metric(type === 'keyword' ? report.roi : report.retainedRoi), charge: metric(report.charge),
         displayStatus: row?.displayStatus ?? null, onlineStatus: row?.onlineStatus ?? null });
     }
@@ -192,10 +200,10 @@ export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
   let complete = false;
   for (let pageNumber = 0; pageNumber < maxPages; pageNumber++) {
     const params = { ...JSON.parse(JSON.stringify(base)), offset: rows.length, pageSize };
-    const response = await api(params);
+    const response = await query(params);
     const data = response?.data;
     if (!Array.isArray(data?.list)) {
-      throw new Error(response?.info?.message || 'API did not return data.list');
+      throw new Error(`Campaign query failed: ${response?.info?.message || 'API did not return data.list'}`);
     }
     if (data.list.length > pageSize) throw new Error('API returned more rows than requested');
     if (data.count !== undefined && data.count !== null) {
@@ -236,6 +244,7 @@ export async function scanCampaignPage({ type, pageSize, maxPages, targets }) {
         promotionType: type === 'keyword' ? '关键词推广' : '全站推',
         campaignName: row.campaignName || '',
         campaignId: String(row.campaignId),
+        reportContext,
         // Preserve raw precision for threshold decisions; round only when displaying.
         roi: metric(type === 'keyword' ? report.roi : report.retainedRoi),
         charge: metric(report.charge),
@@ -282,7 +291,21 @@ cli({
       else if (typeof page.navigate === 'function') await page.navigate(url);
       else throw new Error('OpenCLI page navigation API is unavailable');
     };
-    const read = (type, selected) => page.evaluate(`(${scanCampaignPage.toString()})(${JSON.stringify({ type, pageSize, maxPages, targets: selected })})`);
+    const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+    const read = async (type, selected) => {
+      // Background tabs can suspend page timers. Run every readiness wait in Node.
+      await wait(4000);
+      const notReady = new RegExp(`^(?:Error: )?${type} campaign list is not ready(?:\\n|$)`);
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await page.evaluate(`(${scanCampaignPage.toString()})(${JSON.stringify({ type, pageSize, maxPages, targets: selected })})`);
+        } catch (error) {
+          // Only a definitive failure before the first query may repeat this read.
+          if (attempt >= 19 || !notReady.test(error?.message || '')) throw error;
+          await wait(500);
+        }
+      }
+    };
     if (targets) {
       let identity;
       const rows = [];

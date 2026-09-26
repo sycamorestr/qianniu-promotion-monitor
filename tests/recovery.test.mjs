@@ -20,6 +20,8 @@ const optionalOption = (args, name) => {
   return index < 0 ? undefined : args[index + 1];
 };
 const keyOf = row => `${row.profile}|${row.promotionType}|${row.campaignId}`;
+const settledTargetsFor = rows => JSON.stringify(rows.map(({ profile, promotionType, campaignId }) =>
+  ({ profile, promotionType, campaignId })));
 
 function configFor(profiles = identities) {
   return { profiles, allowedBrowserUsers: profiles.map(row => row.browserUser), thresholds,
@@ -100,6 +102,263 @@ function seedAudit(context, payload, { partial = false, state } = {}) {
   fs.writeFileSync(path.join(context.auditDir, `${payload.runId}${suffix}`), JSON.stringify(payload));
   if (state) fs.writeFileSync(path.join(context.auditDir, 'state.json'), JSON.stringify(state));
 }
+
+test('settled target evidence permits only the exact campaign and preserves its one-retry budget', async t => {
+  const context = setup(t, identities);
+  const runId = 'exact-settled-target';
+  const target = campaign(identities[0], 'shared-id');
+  const otherPlan = campaign(identities[0], 'other-id');
+  const otherType = campaign(identities[0], 'shared-id', { promotionType: '关键词推广' });
+  const otherShop = campaign(identities[1], 'shared-id');
+  const rows = [target, otherPlan, otherType, otherShop];
+  seedAudit(context, auditFor(runId, context.config, rows));
+  const pauses = [];
+  const dependencies = { env: envWithWebhook, log() {}, callOpencli(args) {
+    const identity = identities.find(row => row.profile === option(args, '--profile'));
+    if (args[3] === 'scan-campaigns') return verificationResult(identity, targetsFrom(args), 'active');
+    pauses.push(`${identity.profile}|${option(args, '--promotion-type')}|${option(args, '--campaign-id')}`);
+    throw new Error('uncertain target write');
+  } };
+  const options = { ...context.options, recover: runId, retryPauses: true, settledTargets: settledTargetsFor([target]) };
+  const first = await run(options, dependencies);
+  assert.deepEqual(pauses, ['alpha|all-site|shared-id']);
+  assert.deepEqual(first.recovery.retryCounts, { [keyOf(target)]: 1 });
+  assert.equal(first.pauseAttempts[0].settlementScope, 'target');
+  assert.equal(first.pauseAttempts[0].agentConfirmedSettled, true);
+  const second = await run(options, dependencies);
+  assert.deepEqual(pauses, ['alpha|all-site|shared-id']);
+  assert.deepEqual(second.recovery.retryCounts, { [keyOf(target)]: 1 });
+});
+
+test('an uncertain recovery write does not suppress another independently settled campaign', async t => {
+  const context = setup(t);
+  const runId = 'independent-settled-targets';
+  const uncertain = campaign(identities[0], 'uncertain');
+  const independent = campaign(identities[0], 'independent');
+  const notSettled = campaign(identities[0], 'not-settled');
+  seedAudit(context, auditFor(runId, context.config, [uncertain, independent, notSettled]));
+  const pauses = [];
+  let independentPaused = false;
+  const result = await run({ ...context.options, recover: runId, retryPauses: true,
+    settledTargets: settledTargetsFor([uncertain, independent]) }, {
+    env: envWithWebhook, log() {}, callOpencli(args) {
+      if (args[3] === 'scan-campaigns') return verificationResult(identities[0], targetsFrom(args), target =>
+        target.campaignId === independent.campaignId && independentPaused ? 'inactive' : 'active');
+      const id = option(args, '--campaign-id');
+      pauses.push(id);
+      if (id === uncertain.campaignId) throw new Error('uncertain write');
+      independentPaused = true;
+      return verified(independent);
+    },
+  });
+  assert.deepEqual(pauses, [uncertain.campaignId, independent.campaignId]);
+  assert.deepEqual(result.pauseAttempts.map(row => row.status), ['uncertain', 'verified']);
+  assert.deepEqual(result.recovery.retryCounts, { [keyOf(uncertain)]: 1, [keyOf(independent)]: 1 });
+  assert.deepEqual(result.closeResults.map(row => row.campaignId), [independent.campaignId]);
+  assert.equal(result.recovery.unresolved.some(row => row.campaignId === notSettled.campaignId), true);
+});
+
+test('recovery cleanup evidence keeps its full campaign identity without changing uncertainty or retry authority', async t => {
+  const context = setup(t);
+  const runId = 'recovery-cleanup-evidence';
+  const rows = [campaign(identities[0], 'same-id'),
+    campaign(identities[0], 'same-id', { promotionType: '关键词推广' })];
+  seedAudit(context, auditFor(runId, context.config, rows));
+  const pauses = [];
+  const dependencies = { env: envWithWebhook, log() {}, callOpencli(args) {
+    if (args[3] === 'scan-campaigns') return verificationResult(identities[0], targetsFrom(args), 'active');
+    const type = option(args, '--promotion-type');
+    pauses.push(type);
+    throw Object.assign(new Error('write response unknown'), { pageClosed: type === 'all-site' });
+  } };
+  const options = { ...context.options, recover: runId, retryPauses: true, settledTargets: settledTargetsFor(rows) };
+  const result = await run(options, dependencies);
+  const evidence = records => records.map(({ profile, promotionType, campaignId, pageClosed }) =>
+    ({ profile, promotionType, campaignId, pageClosed }));
+  const expected = rows.map(row => ({ profile: row.profile, promotionType: row.promotionType,
+    campaignId: row.campaignId, pageClosed: row.promotionType === '全站推' }));
+  assert.deepEqual(evidence(result.pauseAttempts), expected);
+  assert.deepEqual(evidence(result.failures.filter(row => row.type === 'pause')), expected);
+  assert.ok(result.pauseAttempts.every(row => row.status === 'uncertain' && row.operationSettled === undefined));
+  assert.deepEqual(result.recovery.retryCounts, Object.fromEntries(rows.map(row => [keyOf(row), 1])));
+  await run({ ...context.options, recover: runId }, dependencies);
+  await run(options, dependencies);
+  assert.deepEqual(pauses, ['all-site', 'keyword']);
+  await assert.rejects(run({ ...context.options, recover: runId, retryPauses: true }, dependencies),
+    /Retry requires --settled-targets or --settled-profiles/);
+});
+
+test('login loss during a recovery write still blocks other settled campaigns in that shop', async t => {
+  const context = setup(t);
+  const runId = 'settled-target-login-loss';
+  const rows = [campaign(identities[0], 'first'), campaign(identities[0], 'second')];
+  seedAudit(context, auditFor(runId, context.config, rows));
+  const pauses = [];
+  const result = await run({ ...context.options, recover: runId, retryPauses: true, settledTargets: settledTargetsFor(rows) }, {
+    env: envWithWebhook, log() {}, callOpencli(args) {
+      if (args[3] === 'scan-campaigns') return verificationResult(identities[0], targetsFrom(args), 'active');
+      pauses.push(option(args, '--campaign-id'));
+      throw new Error('Authentication required: Alimama login page is active');
+    },
+  });
+  assert.deepEqual(pauses, ['first']);
+  assert.equal(result.failures.at(-1).reason, 'auth-required');
+});
+
+test('recovery rejects invalid or unknown settled target identities before browser calls', async t => {
+  const context = setup(t);
+  const runId = 'invalid-settled-targets';
+  const row = campaign(identities[0]);
+  seedAudit(context, auditFor(runId, context.config, [row]));
+  for (const settledTargets of ['[]', settledTargetsFor([row, row]),
+    settledTargetsFor([{ ...row, profile: 'unknown-profile' }])]) {
+    await assert.rejects(run({ ...context.options, recover: runId, retryPauses: true, settledTargets }, {
+      env: envWithWebhook, callOpencli() { assert.fail('invalid settlement must not contact the browser'); },
+    }), /settled-targets|Unknown settled target profile/);
+  }
+  await assert.rejects(run({ ...context.options, settledTargets: settledTargetsFor([row]) }, {
+    env: envWithWebhook, callOpencli() { assert.fail('settlement is recovery-only'); },
+  }), /requires --recover/);
+});
+
+test('settled targets must belong to this audit before any browser or audit side effect', async t => {
+  const context = setup(t);
+  const runId = 'settled-target-membership';
+  const row = campaign(identities[0], 'known-id');
+  seedAudit(context, auditFor(runId, context.config, [row]), {
+    state: { paused: {}, pending: { [keyOf(row)]: { ...row, runId, status: 'pending' } } },
+  });
+  const before = Object.fromEntries(fs.readdirSync(context.auditDir).map(name =>
+    [name, fs.readFileSync(path.join(context.auditDir, name), 'utf8')]));
+  let sideEffects = 0;
+  for (const target of [
+    { ...row, campaignId: 'mistyped-id' },
+    { ...row, promotionType: '关键词推广' },
+  ]) {
+    await assert.rejects(run({ ...context.options, recover: runId, retryPauses: true,
+      settledTargets: settledTargetsFor([target]) }, {
+      env: envWithWebhook, log() { sideEffects++; },
+      callOpencli() { sideEffects++; }, send() { sideEffects++; },
+    }), /Settled target is not a candidate in this audit/);
+    assert.equal(sideEffects, 0);
+    const after = Object.fromEntries(fs.readdirSync(context.auditDir).map(name =>
+      [name, fs.readFileSync(path.join(context.auditDir, name), 'utf8')]));
+    assert.deepEqual(after, before, 'invalid target must not change audit rounds, state or files');
+  }
+});
+
+test('settled target and legacy whole-profile confirmations can be combined', async t => {
+  const context = setup(t, identities);
+  const runId = 'mixed-settlement-scope';
+  const alpha = campaign(identities[0], 'alpha');
+  const beta = campaign(identities[1], 'beta');
+  seedAudit(context, auditFor(runId, context.config, [alpha, beta]));
+  const pauses = [];
+  const result = await run({ ...context.options, recover: runId, retryPauses: true, settledProfiles: 'beta',
+    settledTargets: settledTargetsFor([alpha]) }, {
+    env: envWithWebhook, log() {}, callOpencli(args) {
+      const identity = identities.find(row => row.profile === option(args, '--profile'));
+      if (args[3] === 'scan-campaigns') return verificationResult(identity, targetsFrom(args),
+        pauses.includes(identity.profile) ? 'inactive' : 'active');
+      pauses.push(identity.profile);
+      return verified(identity.profile === 'alpha' ? alpha : beta);
+    },
+  });
+  assert.deepEqual(pauses, ['alpha', 'beta']);
+  assert.deepEqual(result.pauseAttempts.map(row => row.settlementScope), ['target', 'profile']);
+  assert.equal(result.recovery.status, 'ready-to-finalize');
+});
+
+test('historical read-only recovery releases only the settled target lock in a shared shop', async t => {
+  const context = setup(t);
+  const runId = 'historical-exact-settlement';
+  const settled = campaign(identities[0], 'settled');
+  const other = campaign(identities[0], 'not-settled');
+  const rows = [settled, other];
+  seedAudit(context, auditFor(runId, context.config, rows, { notification: { status: 'sent', sent: 2 } }), {
+    state: { paused: {}, pending: Object.fromEntries(rows.map(row => [keyOf(row), { ...row, runId, status: 'pending' }])) },
+  });
+  const result = await run({ ...context.options, recover: runId, settledTargets: settledTargetsFor([settled]) }, {
+    env: envWithWebhook, log() {}, send() { assert.fail('historical read-back must not notify'); },
+    callOpencli(args) {
+      assert.equal(args[3], 'scan-campaigns');
+      return verificationResult(identities[0], targetsFrom(args), 'active');
+    },
+  });
+  const state = JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8'));
+  assert.deepEqual(Object.keys(state.pending), [keyOf(other)]);
+  assert.deepEqual(result.recovery.released.map(row => row.key), [keyOf(settled)]);
+  assert.deepEqual(result.recovery.unresolved.map(row => row.campaignId), [other.campaignId]);
+});
+
+test('recovery passes the latest verified report context instead of the historical scan context', async t => {
+  const context = setup(t);
+  const runId = 'current-report-context';
+  const historical = { startTime: '2026-09-19', endTime: '2026-09-19', isRt: true,
+    sourceList: ['scene', 'campaign_list'], adzonePkgIdList: [], effectEqual: '15', unifyType: 'last_click_by_effect_time' };
+  const current = { ...historical, startTime: '2026-09-21', endTime: '2026-09-21' };
+  const row = campaign(identities[0], 'current-context', { reportContext: historical });
+  seedAudit(context, auditFor(runId, context.config, [row]));
+  let paused = false;
+  const result = await run({ ...context.options, recover: runId, retryPauses: true, settledProfiles: 'alpha' }, {
+    env: envWithWebhook, log() {},
+    callOpencli(args) {
+      if (args[3] === 'scan-campaigns') {
+        return verificationResult(identities[0], targetsFrom(args), paused ? 'inactive' : 'active', { reportContext: current });
+      }
+      assert.deepEqual(JSON.parse(option(args, '--report-context')), current);
+      paused = true;
+      return verified(row);
+    },
+  });
+  assert.equal(paused, true);
+  assert.equal(result.recovery.status, 'ready-to-finalize');
+});
+
+test('recovery prechecks remain not-written after read-back and subsequent read-only recovery', async t => {
+  for (const reason of ['metrics-changed', 'report-context-mismatch', 'target-not-active', 'read-timeout']) {
+    await t.test(reason, async t => {
+      const context = setup(t);
+      const runId = `not-written-${reason}`;
+      const row = campaign(identities[0]);
+      seedAudit(context, auditFor(runId, context.config, [row]), {
+        state: { paused: {}, pending: { [keyOf(row)]: { ...row, runId, status: 'pending' } } },
+      });
+      let reads = 0, pauses = 0;
+      const dependencies = {
+        env: envWithWebhook, log() {},
+        callOpencli(args) {
+          if (args[3] === 'scan-campaigns') {
+            reads++;
+            return verificationResult(identities[0], targetsFrom(args), 'active');
+          }
+          assert.equal(args.includes('--report-context'), false);
+          pauses++;
+          throw Object.assign(new Error(`Pause precheck rejected (${reason}); no write was attempted`), {
+            code: 'PAUSE_PRECHECK_REJECTED', reason, writeAttempted: false, operationSettled: true,
+          });
+        },
+      };
+      const result = await run({ ...context.options, recover: runId, retryPauses: true, settledProfiles: 'alpha' }, dependencies);
+      assert.equal(reads, 2);
+      assert.equal(pauses, 1);
+      assert.equal(result.pauseAttempts.at(-1).status, 'not-written');
+      assert.equal(result.pauseAttempts.at(-1).reason, reason);
+      assert.equal(result.pauseAttempts.at(-1).writeAttempted, false);
+      assert.equal(result.pauseAttempts.at(-1).operationSettled, true);
+      assert.equal(result.failures.at(-1).reason, reason);
+      assert.equal(result.failures.at(-1).writeAttempted, false);
+      assert.equal(result.pauseReadbacks.at(-1).campaigns[0].outcome, 'active');
+      assert.equal(result.recovery.status, 'awaiting-agent');
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8')).pending, {});
+
+      await run({ ...context.options, recover: runId }, dependencies);
+      assert.equal(pauses, 1);
+      assert.equal(reads, 3);
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8')).pending, {});
+    });
+  }
+});
 
 test('initial execute isolates an uncertain shop, continues other shops, and defers notification', async t => {
   const context = setup(t, identities);
@@ -342,7 +601,7 @@ test('fresh improved metrics resolve an active candidate without a recovery writ
   assert.equal(state.pending[keyOf(row)], undefined);
 });
 
-test('a foreign pending owner survives recovery and blocks writes for that campaign', async t => {
+test('recovery ignores a historical pending owner and writes the current eligible campaign', async t => {
   const context = setup(t);
   const runId = 'current-recovery-run';
   const foreignRunId = 'older-unresolved-run';
@@ -364,16 +623,16 @@ test('a foreign pending owner survives recovery and blocks writes for that campa
     },
   });
 
-  assert.equal(scans, 1);
-  assert.equal(pauses, 0);
+  assert.equal(scans, 2);
+  assert.equal(pauses, 1);
   assert.equal(result.recovery.status, 'awaiting-agent');
-  assert.deepEqual(result.recovery.retryCounts, {});
+  assert.deepEqual(result.recovery.retryCounts, { [keyOf(row)]: 1 });
   const state = JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8'));
-  assert.equal(state.pending[keyOf(row)].runId, foreignRunId);
-  assert.equal(state.pending[keyOf(row)].status, 'pending');
+  assert.equal(state.pending[keyOf(row)].runId, runId);
+  assert.equal(state.pending[keyOf(row)].status, 'active');
 });
 
-test('a foreign pending campaign does not block another campaign in the same shop', async t => {
+test('recovery replaces historical pending entries for every current eligible campaign', async t => {
   const context = setup(t);
   const runId = 'current-recovery-run';
   const foreignRunId = 'older-unresolved-run';
@@ -382,32 +641,31 @@ test('a foreign pending campaign does not block another campaign in the same sho
   seedAudit(context, auditFor(runId, context.config, [blocked, eligible]), {
     state: { paused: {}, pending: { [keyOf(blocked)]: { ...blocked, runId: foreignRunId, status: 'pending' } } },
   });
-  let pauses = 0;
-  let paused = false;
+  const paused = new Set();
 
   const result = await run({ ...context.options, recover: runId, retryPauses: true, settledProfiles: 'alpha' }, {
     env: envWithWebhook, log() {},
     callOpencli(args) {
       if (args[3] === 'scan-campaigns') {
         const targets = targetsFrom(args);
-        return verificationResult(identities[0], targets, target =>
-          target.campaignId === eligible.campaignId && paused ? 'inactive' : 'active');
+        return verificationResult(identities[0], targets, target => paused.has(target.campaignId) ? 'inactive' : 'active');
       }
-      pauses++;
-      assert.equal(option(args, '--campaign-id'), eligible.campaignId);
-      paused = true;
-      return verified(eligible);
+      const campaignId = option(args, '--campaign-id');
+      paused.add(campaignId);
+      return verified(campaignId === blocked.campaignId ? blocked : eligible);
     },
   });
 
-  assert.equal(pauses, 1);
+  assert.deepEqual([...paused].sort(), [blocked.campaignId, eligible.campaignId].sort());
+  assert.equal(result.closeResults.length, 2);
+  assert.equal(result.recovery.status, 'ready-to-finalize');
   assert.equal(result.closeResults.some(row => row.campaignId === eligible.campaignId), true);
   const state = JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8'));
-  assert.equal(state.pending[keyOf(blocked)].runId, foreignRunId);
+  assert.equal(state.pending[keyOf(blocked)], undefined);
   assert.equal(state.pending[keyOf(eligible)], undefined);
 });
 
-test('a newer run cannot claim an older run pending; recovering the owner remains possible', async t => {
+test('a new execute supersedes historical pending records with its own fresh action list', async t => {
   const context = setup(t);
   const ownerRunId = 'owner-run-a';
   const first = campaign(identities[0], 'plan-a');
@@ -415,62 +673,28 @@ test('a newer run cannot claim an older run pending; recovering the owner remain
   seedAudit(context, auditFor(ownerRunId, context.config, [first]), {
     state: { paused: {}, pending: { [keyOf(first)]: { ...first, runId: ownerRunId, status: 'pending' } } },
   });
-  let initialPauses = 0;
+  const paused = [];
 
   const newer = await run(context.options, {
-    env: envWithWebhook, log() {}, send() { assert.fail('an unresolved newer run must not notify'); },
+    env: envWithWebhook, log() {}, send() {},
     callOpencli(args) {
       if (args[3] === 'pause-campaign') {
-        initialPauses++;
-        return verified(option(args, '--campaign-id') === second.campaignId ? second : first);
+        const campaignId = option(args, '--campaign-id');
+        paused.push(campaignId);
+        return verified(campaignId === second.campaignId ? second : first);
       }
       const targets = targetsFrom(args);
       if (targets) return verificationResult(identities[0], targets, 'active');
       return scanResult(identities[0], [first, second]);
     },
   });
-  assert.equal(initialPauses, 1);
-  assert.equal(newer.notification.status, 'awaiting-agent');
-  assert.ok(newer.recovery.unresolved.some(item => item.type === 'prior-run' && item.runId === ownerRunId));
-  let state = JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8'));
-  assert.deepEqual(Object.keys(state.pending), [keyOf(first)]);
-  assert.equal(state.pending[keyOf(first)].runId, ownerRunId);
-
-  let newerRecoveryPauses = 0;
-  const recoveredNewer = await run({ ...context.options, recover: newer.runId,
-    retryPauses: true, settledProfiles: 'alpha' }, {
-    env: envWithWebhook, log() {},
-    callOpencli(args) {
-      if (args[3] === 'pause-campaign') { newerRecoveryPauses++; return verified(first); }
-      const targets = targetsFrom(args);
-      return verificationResult(identities[0], targets, target =>
-        target.campaignId === second.campaignId ? 'inactive' : 'active');
-    },
-  });
-  assert.equal(newerRecoveryPauses, 0);
-  assert.equal(recoveredNewer.recovery.status, 'awaiting-agent');
-  state = JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8'));
-  assert.deepEqual(Object.keys(state.pending), [keyOf(first)]);
-  assert.equal(state.pending[keyOf(first)].runId, ownerRunId);
-
-  let ownerScans = 0, ownerPauses = 0;
-  const recoveredOwner = await run({ ...context.options, recover: ownerRunId,
-    retryPauses: true, settledProfiles: 'alpha' }, {
-    env: envWithWebhook, log() {},
-    callOpencli(args) {
-      if (args[3] === 'scan-campaigns') {
-        ownerScans++;
-        return verificationResult(identities[0], targetsFrom(args), ownerScans === 1 ? 'active' : 'inactive');
-      }
-      ownerPauses++;
-      return verified(first);
-    },
-  });
-  assert.equal(ownerPauses, 1);
-  assert.equal(recoveredOwner.closeResults.length, 1);
-  assert.equal(recoveredOwner.recovery.status, 'ready-to-finalize');
-  state = JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8'));
+  assert.deepEqual(paused.sort(), [first.campaignId, second.campaignId].sort());
+  assert.equal(newer.notification.status, 'sent');
+  assert.equal(newer.recovery, undefined);
+  const state = JSON.parse(fs.readFileSync(path.join(context.auditDir, 'state.json'), 'utf8'));
   assert.deepEqual(state.pending, {});
+  assert.equal(state.paused[keyOf(first)].runId, newer.runId);
+  assert.equal(state.paused[keyOf(second)].runId, newer.runId);
 });
 
 test('an active campaign with missing metrics remains unresolved and is never retried', async t => {

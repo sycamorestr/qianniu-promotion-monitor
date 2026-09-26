@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { isAuthenticationError, parseArgs, run, selectCampaigns, splitMessages, validateConfig, buildMessages } from '../runner.mjs';
+import { createOpencli, isAuthenticationError, isPausePrecheckRejected, parseArgs, run, selectCampaigns,
+  splitMessages, validateConfig, buildMessages } from '../runner.mjs';
 
 const thresholds = { notifyRoiBelow: 2, closeChargeAbove: 30, closeRoiBelow: 1.5 };
 const identities = [
@@ -69,11 +70,95 @@ test('default invocation is local report and validates arguments', () => {
   assert.throws(() => parseArgs(['--unexpected']));
 });
 
+test('settled-targets accepts only exact unique identities during recovery', () => {
+  const target = { profile: 'alpha', promotionType: '全站推', campaignId: 'plan-a' };
+  const raw = JSON.stringify([target]);
+  assert.equal(parseArgs(['--recover', 'run-id', '--settled-targets', raw]).settledTargets, raw);
+  assert.equal(parseArgs(['--recover', 'run-id', '--retry-pauses', `--settled-targets=${raw}`]).settledTargets, raw);
+  assert.throws(() => parseArgs(['--settled-targets', raw]), /require --recover/);
+  assert.throws(() => parseArgs(['--finalize', 'run-id', '--settled-targets', raw]), /require --recover/);
+  for (const invalid of ['broken', '[]', '{}', 'null', '[null]',
+    JSON.stringify([{ ...target, campaignId: '' }]),
+    JSON.stringify([{ ...target, campaignId: 123 }]),
+    JSON.stringify([{ ...target, campaignId: ' plan-a' }]),
+    JSON.stringify([{ ...target, profile: 'alpha ' }]),
+    JSON.stringify([{ ...target, promotionType: 'all-site' }]),
+    JSON.stringify([{ ...target, campaignName: 'extra' }]),
+    JSON.stringify([{ promotionType: target.promotionType, campaignId: target.campaignId }]),
+    JSON.stringify([target, { campaignId: target.campaignId, profile: target.profile, promotionType: target.promotionType }]),
+  ]) {
+    assert.throws(() => parseArgs(['--recover', 'run-id', '--settled-targets', invalid]), /settled-targets/);
+  }
+  const distinct = JSON.stringify([target, { ...target, promotionType: '关键词推广' }, { ...target, profile: 'beta' }]);
+  assert.equal(parseArgs(['--recover', 'run-id', '--settled-targets', distinct]).settledTargets, distinct);
+});
+
 test('authentication errors are terminal while ordinary browser errors remain retryable', () => {
   assert.equal(isAuthenticationError(new Error('Authentication required: Alimama login page is active')), true);
   assert.equal(isAuthenticationError(new Error('登录态已失效')), true);
   assert.equal(isAuthenticationError(new Error('OpenCLI exited with status 75')), false);
   assert.equal(isAuthenticationError(new Error('Campaign list is not ready')), false);
+});
+
+test('OpenCLI classifies only explicit settled pause prechecks and never retains raw diagnostics', () => {
+  const call = createOpencli({ ...process.env, OPENCLI_BIN: process.execPath });
+  for (const [marker, reason] of [
+    ['METRICS_CHANGED', 'metrics-changed'], ['REPORT_CONTEXT_MISMATCH', 'report-context-mismatch'],
+    ['TARGET_NOT_ACTIVE', 'target-not-active'], ['READ_TIMEOUT', 'read-timeout'],
+  ]) {
+    const diagnostics = `private-session-fixture [PAUSE_PRECHECK:${marker}] private-response-fixture`;
+    assert.throws(() => call(['-e', `process.stderr.write(${JSON.stringify(diagnostics)});process.exit(1)`,
+      '--', 'alimama', 'pause-campaign']), error => {
+      assert.equal(isPausePrecheckRejected(error), true);
+      assert.equal(error.reason, reason);
+      assert.doesNotMatch(error.message + JSON.stringify(error), /private-session|private-response/);
+      return true;
+    });
+  }
+  for (const [command, diagnostics] of [
+    ['pause-campaign', 'CDP Runtime.evaluate timed out after 175s'],
+    ['pause-campaign', 'Latest campaign metrics no longer satisfy ROI < max-roi and charge > min-charge'],
+    ['pause-campaign', '[PAUSE_PRECHECK:UNKNOWN]'],
+    ['pause-campaign', '[PAUSE_PRECHECK:METRICS_CHANGED] [PAUSE_PRECHECK:READ_TIMEOUT]'],
+    ['pause-campaign', 'Pause outcome uncertain; do not retry write before reading current status: [PAUSE_PRECHECK:READ_TIMEOUT]'],
+    ['pause-campaign', 'Pause was requested but verification failed; do not retry write before reading current status: [PAUSE_PRECHECK:REPORT_CONTEXT_MISMATCH]'],
+    ['scan-campaigns', '[PAUSE_PRECHECK:READ_TIMEOUT]'],
+  ]) {
+    assert.throws(() => call(['-e', `process.stderr.write(${JSON.stringify(diagnostics)});process.exit(1)`,
+      '--', 'alimama', command]), error => {
+      assert.equal(isPausePrecheckRejected(error), false);
+      assert.equal(error.code, undefined);
+      assert.equal(error.writeAttempted, undefined);
+      return true;
+    });
+  }
+});
+
+test('a killed OpenCLI process stays uncertain even if it previously printed a precheck marker', () => {
+  const call = createOpencli({ ...process.env, OPENCLI_BIN: process.execPath, OPENCLI_TIMEOUT_MS: '1000' });
+  assert.throws(() => call(['-e',
+    "process.stderr.write('[PAUSE_PRECHECK:READ_TIMEOUT]');setTimeout(() => {}, 3000)",
+    '--', 'alimama', 'pause-campaign']), error => {
+    assert.equal(isPausePrecheckRejected(error), false);
+    assert.match(error.message, /process failed/);
+    assert.equal(error.writeAttempted, undefined);
+    return true;
+  });
+});
+
+test('page cleanup evidence never changes an uncertain write into a precheck rejection', () => {
+  const call = createOpencli({ ...process.env, OPENCLI_BIN: process.execPath });
+  for (const [marker, closed] of [['CLOSED', true], ['CLOSE_FAILED', false]]) {
+    const diagnostics = `[PAUSE_PAGE:${marker}] Pause outcome uncertain private-cleanup-fixture`;
+    assert.throws(() => call(['-e', `process.stderr.write(${JSON.stringify(diagnostics)});process.exit(1)`,
+      '--', 'alimama', 'pause-campaign']), error => {
+      assert.equal(error.pageClosed, closed);
+      assert.equal(isPausePrecheckRejected(error), false);
+      assert.equal(error.writeAttempted, undefined);
+      assert.doesNotMatch(JSON.stringify(error) + error.message, /private-cleanup/);
+      return true;
+    });
+  }
 });
 
 test('configuration allows one or many shops but rejects missing identity and whitelist violations', () => {
@@ -244,6 +329,88 @@ test('execute supplies current identity and thresholds; unresolved read-back def
   assert.doesNotMatch(betaSection, /<font color="info">已暂停<\/font>/);
   assert.match(notification, /<font color="comment">全站推｜花费 40\.00｜ROI 1\.00｜ID shared-id<\/font>/);
   assert.doesNotMatch(notification, /uncertain write|not-in-active-list|当前不活动|未归因|归因|待停止计划|推广未暂停/);
+});
+
+test('initial pauses pass the scan report context only when it is available', async t => {
+  const context = { startTime: '2026-09-21', endTime: '2026-09-21', isRt: true,
+    sourceList: ['scene', 'campaign_list'], adzonePkgIdList: [], effectEqual: '15', unifyType: 'last_click_by_effect_time' };
+  const pauses = [];
+  await run(setup(t, 'execute'), {
+    env: envWithWebhook, log() {}, send() {},
+    callOpencli(args) {
+      const identity = identities.find(row => row.profile === args[1]);
+      if (args[3] === 'scan-campaigns') return scanResult(identity, identity.profile === 'alpha' ? { reportContext: context } : {});
+      pauses.push(identity.profile);
+      if (identity.profile === 'alpha') assert.deepEqual(JSON.parse(option(args, '--report-context')), context);
+      else assert.equal(args.includes('--report-context'), false);
+      return { ...campaign(identity), ok: true, verified: true, writeAttempted: true, afterStatus: 'pause' };
+    },
+  });
+  assert.deepEqual(pauses, ['alpha', 'beta']);
+});
+
+test('settled initial prechecks record no write and still read back without recreating pending intent', async t => {
+  for (const reason of ['metrics-changed', 'report-context-mismatch', 'target-not-active', 'read-timeout']) {
+    await t.test(reason, async t => {
+      const identity = identities[0];
+      const options = setup(t, 'execute', configFor([identity]));
+      const calls = [];
+      const result = await run(options, {
+        env: envWithWebhook, log() {}, send() { assert.fail('still-eligible plan requires recovery'); },
+        callOpencli(args) {
+          calls.push(args[3]);
+          if (args[3] === 'scan-campaigns') {
+            const targets = targetsFrom(args);
+            return targets ? verificationResult(identity, targets, 'active') : scanResult(identity);
+          }
+          throw Object.assign(new Error(`Pause precheck rejected (${reason}); no write was attempted`), {
+            code: 'PAUSE_PRECHECK_REJECTED', reason, writeAttempted: false, operationSettled: true,
+          });
+        },
+      });
+      assert.deepEqual(calls, ['scan-campaigns', 'pause-campaign', 'scan-campaigns']);
+      assert.equal(result.pauseAttempts[0].status, 'not-written');
+      assert.equal(result.pauseAttempts[0].reason, reason);
+      assert.equal(result.pauseAttempts[0].writeAttempted, false);
+      assert.equal(result.pauseAttempts[0].operationSettled, true);
+      assert.equal(result.failures[0].reason, reason);
+      assert.equal(result.failures[0].writeAttempted, false);
+      assert.equal(result.pauseReadbacks[0].campaigns[0].outcome, 'active');
+      assert.equal(result.recovery.status, 'awaiting-agent');
+      const state = JSON.parse(fs.readFileSync(path.join(options.auditDir, 'state.json'), 'utf8'));
+      assert.deepEqual(state.pending, {});
+    });
+  }
+});
+
+test('initial cleanup evidence stays attached to the full campaign identity and never authorizes a retry', async t => {
+  const identity = identities[0];
+  const options = setup(t, 'execute', configFor([identity]));
+  const rows = [campaign(identity), campaign(identity, { promotionType: '关键词推广' })];
+  const pauses = [];
+  const dependencies = { env: envWithWebhook, log() {}, callOpencli(args) {
+    if (args[3] === 'scan-campaigns') {
+      const targets = targetsFrom(args);
+      return targets ? verificationResult(identity, targets, 'active')
+        : [{ recordType: 'identity', shopName: identity.expectedAlimamaShop }, ...rows];
+    }
+    const type = option(args, '--promotion-type');
+    pauses.push(type);
+    throw Object.assign(new Error('write response unknown'), { pageClosed: type === 'all-site' });
+  } };
+  const result = await run(options, dependencies);
+  const evidence = records => records.map(({ profile, promotionType, campaignId, pageClosed }) =>
+    ({ profile, promotionType, campaignId, pageClosed }));
+  const expected = rows.map(row => ({ profile: identity.profile, promotionType: row.promotionType,
+    campaignId: row.campaignId, pageClosed: row.promotionType === '全站推' }));
+  assert.deepEqual(evidence(result.pauseAttempts), expected);
+  assert.deepEqual(evidence(result.failures.filter(row => row.type === 'pause')), expected);
+  assert.ok(result.pauseAttempts.every(row => row.status === 'uncertain' && row.operationSettled === undefined));
+  await run({ ...options, recover: result.runId }, dependencies);
+  assert.deepEqual(pauses, ['all-site', 'keyword']);
+  await assert.rejects(run({ ...options, recover: result.runId, retryPauses: true }, dependencies),
+    /Retry requires --settled-targets or --settled-profiles/);
+  assert.deepEqual(pauses, ['all-site', 'keyword']);
 });
 
 test('a lost login stops retries and all later writes for that profile', async t => {
@@ -579,6 +746,35 @@ test('an uncertain write blocks only that campaign while other campaigns still p
   assert.equal(state.pending['alpha|全站推|second'], undefined);
   assert.equal(state.paused['beta|全站推|shared-id'].result.verified, true);
   assert.equal(state.paused['alpha|全站推|second'].result.verified, true);
+});
+
+test('a new execute ignores historical pending entries and pauses a newly eligible campaign', async t => {
+  const identity = identities[0];
+  const options = setup(t, 'execute', configFor([identity]));
+  fs.mkdirSync(options.auditDir, { recursive: true });
+  const row = campaign(identity);
+  fs.writeFileSync(path.join(options.auditDir, 'state.json'), JSON.stringify({
+    paused: {}, pending: { [`${identity.profile}|${row.promotionType}|${row.campaignId}`]: {
+      ...row, runId: 'historical-run', status: 'unverified',
+    } },
+  }));
+  const events = [];
+  const result = await run(options, {
+    env: envWithWebhook, log() {}, send() { events.push('notify'); },
+    callOpencli(args) {
+      events.push(args[3]);
+      if (args[3] === 'scan-campaigns') return scanResult(identity);
+      return { ok: true, verified: true, writeAttempted: true, afterStatus: 'pause',
+        shopName: identity.expectedAlimamaShop, promotionType: row.promotionType,
+        campaignId: row.campaignId, campaignName: row.campaignName };
+    },
+  });
+  assert.deepEqual(events, ['scan-campaigns', 'pause-campaign', 'notify', 'notify']);
+  assert.equal(result.recovery, undefined);
+  assert.equal('pendingRuns' in result, false);
+  const state = JSON.parse(fs.readFileSync(path.join(options.auditDir, 'state.json'), 'utf8'));
+  assert.deepEqual(state.pending, {});
+  assert.equal(state.paused[`${identity.profile}|${row.promotionType}|${row.campaignId}`].runId, result.runId);
 });
 
 test('notification failures are saved without repeating scans or sends and never include the webhook', async t => {

@@ -2,8 +2,7 @@ import { cli, Strategy } from '@jackwener/opencli/registry';
 
 // Executed in the authenticated page; no external module closures are available here.
 export async function pauseCampaignPage(options) {
-  const { type, id, execute, expectedShop, expectedName, maxRoi, minCharge, pageSize, maxPages } = options;
-  await new Promise(resolve => setTimeout(resolve, 4000));
+  const { type, id, execute, verify, expectedShop, expectedName, maxRoi, minCharge, reportContext } = options;
   const route = type === 'keyword' ? '/manage/search' : '/manage/onesite';
   const onRoute = href => {
     try {
@@ -91,7 +90,7 @@ export async function pauseCampaignPage(options) {
         || typeof item.isRt !== 'boolean'
       );
   let view, api, submit;
-  for (let attempt = 0; attempt < 20; attempt++) {
+  {
     assertRoute();
     dismissKnownMarketingOverlay();
     let Magix;
@@ -115,8 +114,6 @@ export async function pauseCampaignPage(options) {
         break;
       }
     }
-    if (view) break;
-    if (attempt < 19) await new Promise(resolve => setTimeout(resolve, 500));
   }
   if (!view) throw new Error('Campaign list is not ready');
   const identity = () => {
@@ -146,6 +143,12 @@ export async function pauseCampaignPage(options) {
     if (!fields.includes(field)) fields.push(field);
   }
   base.rptQuery.fields = fields.join(',');
+  if (reportContext !== undefined) {
+    // JSON omits the keyword page's explicit undefined attribution defaults.
+    const context = { effectEqual: undefined, unifyType: undefined, ...reportContext };
+    if (!reportReady([context])) throw new Error('[PAUSE_PRECHECK:REPORT_CONTEXT_MISMATCH] Invalid scan report context');
+    base.rptQuery.conditionList = [context];
+  }
 
   // Native onebp mxSearch(searchKey=campaignId) is converted by mxSetParams into this exact field.
   // Never infer a successful pause from a missing target or an API that ignores this filter.
@@ -181,13 +184,24 @@ export async function pauseCampaignPage(options) {
     verified: false,
     message: 'dry-run: no write performed',
   };
+  if (verify) {
+    if (typeof campaign.displayStatus !== 'string' || !campaign.displayStatus
+        || typeof campaign.onlineStatus !== 'number' || !Number.isFinite(campaign.onlineStatus)) {
+      throw new Error('API returned invalid campaign status during verification');
+    }
+    if (campaign.displayStatus === 'start' || campaign.onlineStatus === 1) throw new Error('Campaign is still active');
+    if (campaign.displayStatus !== 'pause' || campaign.onlineStatus !== 0) {
+      throw new Error('API returned an unrecognized inactive campaign status');
+    }
+    return { ...result, afterStatus: 'pause', writeAttempted: true, verified: true, message: 'paused and verified' };
+  }
   if (!execute) return result;
   // Recheck every guard inside the page immediately before the only write call.
   if (!expectedShop || !expectedName || !Number.isFinite(maxRoi) || !Number.isFinite(minCharge)) {
     throw new Error('Execution requires expected-shop, expected-name, max-roi, and min-charge');
   }
   if (campaign.displayStatus !== 'start' || campaign.onlineStatus !== 1) {
-    throw new Error('Campaign must have displayStatus=start AND onlineStatus=1');
+    throw new Error('[PAUSE_PRECHECK:TARGET_NOT_ACTIVE] Campaign must have displayStatus=start AND onlineStatus=1');
   }
   const metric = value => {
     if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') return null;
@@ -198,7 +212,7 @@ export async function pauseCampaignPage(options) {
   const roi = metric(type === 'keyword' ? report.roi : report.retainedRoi);
   const charge = metric(report.charge);
   if (roi === null || charge === null || !(roi < maxRoi && charge > minCharge)) {
-    throw new Error('Latest campaign metrics no longer satisfy ROI < max-roi and charge > min-charge');
+    throw new Error('[PAUSE_PRECHECK:METRICS_CHANGED] Latest campaign metrics no longer satisfy ROI < max-roi and charge > min-charge');
   }
   if (typeof view.beforeModify !== 'function') throw new Error('Campaign update API is unavailable');
   identity();
@@ -220,29 +234,9 @@ export async function pauseCampaignPage(options) {
   } catch (error) {
     throw new Error(`Pause outcome uncertain; do not retry write before reading current status: ${error?.message || error}`);
   }
-  try {
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    identity();
-    const after = await readTarget();
-    identity();
-    if (after.campaignName !== expectedName) throw new Error('Campaign name changed during verification');
-    if (typeof after.displayStatus !== 'string' || !after.displayStatus ||
-        typeof after.onlineStatus !== 'number' || !Number.isFinite(after.onlineStatus)) {
-      throw new Error('API returned invalid campaign status during verification');
-    }
-    if (after.displayStatus === 'start' || after.onlineStatus === 1) {
-      throw new Error('Campaign is still active');
-    }
-    if (after.displayStatus !== 'pause' || after.onlineStatus !== 0) {
-      throw new Error('API returned an unrecognized inactive campaign status');
-    }
-    result.afterStatus = after.displayStatus;
-    result.verified = true;
-    result.message = 'paused and verified';
-    return result;
-  } catch (error) {
-    throw new Error(`Pause was requested but verification failed; do not retry write before reading current status: ${error?.message || error}`);
-  }
+  // The host waits before issuing a separate read-only verification. Background
+  // tabs may suspend page timers indefinitely, including this post-write wait.
+  return { ...result, message: 'pause requested; verification pending' };
 }
 
 cli({
@@ -256,6 +250,7 @@ cli({
     { name: 'campaign-id', type: 'str', required: true, help: 'Campaign ID' },
     { name: 'expected-shop', type: 'str', help: 'Exact Alimama shop identity; required with execute' },
     { name: 'expected-name', type: 'str', help: 'Exact campaign name; required with execute' },
+    { name: 'report-context', type: 'str', help: 'Exact non-secret report date and attribution context from the scan' },
     { name: 'max-roi', type: 'str', help: 'Execute only when latest ROI is strictly below this number' },
     { name: 'min-charge', type: 'str', help: 'Execute only when latest charge is strictly above this number' },
     { name: 'page-size', type: 'int', default: 500, help: 'Page size from 1 to 500' },
@@ -273,6 +268,15 @@ cli({
     if (!id.trim()) throw new Error('campaign-id is required');
     const expectedShop = args['expected-shop'];
     const expectedName = args['expected-name'];
+    let reportContext;
+    if (args['report-context'] !== undefined) {
+      try { reportContext = JSON.parse(args['report-context']); } catch { throw new Error('[PAUSE_PRECHECK:REPORT_CONTEXT_MISMATCH] Invalid report context JSON'); }
+      const allowed = new Set(['sourceList', 'adzonePkgIdList', 'effectEqual', 'unifyType', 'startTime', 'endTime', 'isRt']);
+      if (!reportContext || typeof reportContext !== 'object' || Array.isArray(reportContext)
+          || Object.keys(reportContext).some(key => !allowed.has(key))) {
+        throw new Error('[PAUSE_PRECHECK:REPORT_CONTEXT_MISMATCH] Invalid report context fields');
+      }
+    }
     const numberOption = name => {
       const value = args[name];
       if (value === undefined) return undefined;
@@ -292,28 +296,82 @@ cli({
     if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 200) throw new Error('max-pages must be 1..200');
     const route = type === 'keyword' ? '/manage/search' : '/manage/onesite';
     const url = `https://one.alimama.com/index.html#!${route}`;
-    const onRequestedRoute = currentUrl => {
-      try {
-        const parsed = new URL(currentUrl);
-        if (parsed.protocol !== 'https:' || parsed.hostname !== 'one.alimama.com' || !parsed.hash.startsWith('#!')) return false;
-        const virtualUrl = new URL(parsed.hash.slice(2), parsed.origin);
-        return virtualUrl.pathname.replace(/\/$/, '') === route;
-      } catch { return false; }
-    };
-    let currentUrl = null;
-    try {
-      if (typeof page.getCurrentUrl === 'function') currentUrl = await page.getCurrentUrl();
-    } catch { /* Fall through to an explicit navigation when the bridge read is transiently unavailable. */ }
-    if (!onRequestedRoute(currentUrl)) {
-      if (typeof page.goto === 'function') await page.goto(url, { waitUntil: 'none' });
-      else if (typeof page.navigate === 'function') await page.navigate(url);
-      else throw new Error('OpenCLI page navigation API is unavailable');
+    if (typeof page.newTab !== 'function' || typeof page.setActivePage !== 'function'
+        || typeof page.closeTab !== 'function' || typeof page.tabs !== 'function') {
+      throw new Error('OpenCLI dedicated page lifecycle API is unavailable');
     }
-    // Native dialogs and site overlays are not the proven timeout cause, but either can
-    // obstruct the platform's modification flow. Dismiss them without weakening guards.
-    try { if (typeof page.handleJavaScriptDialog === 'function') await page.handleJavaScriptDialog(false); } catch { /* no dialog */ }
-    try { if (typeof page.pressKey === 'function') await page.pressKey('Escape'); } catch { /* best effort */ }
-    const options = { type, id, execute, expectedShop, expectedName, maxRoi, minCharge, pageSize, maxPages };
-    return page.evaluate(`(${pauseCampaignPage.toString()})(${JSON.stringify(options)})`);
+    // Trace capture can create a blank session page before this adapter starts.
+    // newTab would orphan that page: Bridge 1.0.23 tracks only one preferred tab.
+    // Consume only an unambiguous blank in this adapter session. A nonblank page
+    // may contain an older operation, so retain the fresh-page path for it.
+    const sessionTabs = await page.tabs();
+    if (!Array.isArray(sessionTabs)) throw new Error('OpenCLI did not return the session pages');
+    const blank = sessionTabs.length === 1 && sessionTabs[0]?.url === 'about:blank'
+      && typeof sessionTabs[0].page === 'string' && sessionTabs[0].page.trim()
+      && sessionTabs[0].page === sessionTabs[0].page.trim()
+      && typeof page.goto === 'function' ? sessionTabs[0] : null;
+    let target;
+    const cleanup = { pageClosed: false, reusedBlank: Boolean(blank) };
+    try {
+      if (blank) {
+        target = blank.page;
+        page.setActivePage(target);
+        await page.goto(url, { waitUntil: 'none' });
+      } else {
+        target = await page.newTab(url);
+        if (typeof target !== 'string' || !target) throw new Error('OpenCLI did not identify the new pause page');
+        page.setActivePage(target);
+      }
+      try { await page.startNetworkCapture?.(); } catch { /* optional trace */ }
+      try { if (typeof page.handleJavaScriptDialog === 'function') await page.handleJavaScriptDialog(false); } catch { /* no dialog */ }
+      try { if (typeof page.pressKey === 'function') await page.pressKey('Escape'); } catch { /* best effort */ }
+      const options = { type, id, execute, expectedShop, expectedName, maxRoi, minCharge, reportContext };
+      const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+      // These timers must run in Node, never inside the background tab.
+      await wait(4000);
+      const evaluate = async opts => {
+        for (let attempt = 0; ; attempt++) {
+          try { return await page.evaluate(`(${pauseCampaignPage.toString()})(${JSON.stringify(opts)})`); }
+          catch (error) {
+            // Only retry a definitive pre-read readiness failure. Never replay a
+            // request after a query/write timeout or a verification failure.
+            if (attempt >= 19 || !/^(?:Error: )?Campaign list is not ready(?:\n|$)/.test(error?.message || '')) throw error;
+            await wait(500);
+          }
+        }
+      };
+      const result = await evaluate(options);
+      if (!execute) return { ...result, cleanup };
+      await wait(1200);
+      try {
+        const after = await evaluate({ ...options, execute: false, verify: true });
+        return { ...after, beforeStatus: result.beforeStatus, cleanup };
+      } catch (error) {
+        throw new Error(`Pause was requested but verification failed; do not retry write before reading current status: ${error?.message || error}`);
+      }
+    } finally {
+      // A cleanup error must not erase a verified result or a definitive
+      // pre-write rejection. Never log its potentially sensitive raw message.
+      try {
+        if (typeof target !== 'string' || !target) throw new Error('No owned page to release');
+        // Older Bridge versions can silently resolve a stale target ID to the
+        // current preferred tab. Refuse cleanup if ownership has changed.
+        const current = await page.tabs();
+        if (!Array.isArray(current) || current.length !== 1 || current[0]?.page !== target) {
+          throw new Error('Pause page is no longer the current session page');
+        }
+        await page.closeTab(target);
+        const remaining = await page.tabs();
+        if (!Array.isArray(remaining) || remaining.some(tab => tab?.page === target)) {
+          throw new Error('Pause page lease was not released');
+        }
+        // Bridge may retain a reusable about:blank container tab. This flag
+        // confirms release of the operation page, not physical window closure.
+        cleanup.pageClosed = true;
+        console.error('[PAUSE_PAGE:CLOSED]');
+      } catch {
+        console.error('[PAUSE_PAGE:CLOSE_FAILED]');
+      }
+    }
   },
 });

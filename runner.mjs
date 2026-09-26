@@ -28,8 +28,35 @@ export function isAuthenticationError(error) {
   return authenticationErrorPatterns.some(pattern => pattern.test(message));
 }
 
-function opencliFailure(message, diagnostics = '') {
+const pausePrecheckReasons = {
+  METRICS_CHANGED: 'metrics-changed',
+  REPORT_CONTEXT_MISMATCH: 'report-context-mismatch',
+  TARGET_NOT_ACTIVE: 'target-not-active',
+  READ_TIMEOUT: 'read-timeout',
+};
+
+export function isPausePrecheckRejected(error) {
+  return error?.code === 'PAUSE_PRECHECK_REJECTED' && error.writeAttempted === false
+    && error.operationSettled === true && Object.values(pausePrecheckReasons).includes(error.reason);
+}
+
+function opencliFailure(message, diagnostics = '', pauseCommand = false) {
   const error = new Error(message);
+  if (pauseCommand && /\[PAUSE_PAGE:CLOSED\]/.test(diagnostics)
+      && !/\[PAUSE_PAGE:CLOSE_FAILED\]/.test(diagnostics)) error.pageClosed = true;
+  else if (pauseCommand && /\[PAUSE_PAGE:CLOSE_FAILED\]/.test(diagnostics)) error.pageClosed = false;
+  const postWriteFailure = /Pause outcome uncertain|Pause was requested but verification failed/.test(String(diagnostics));
+  const markers = pauseCommand && !postWriteFailure ? [...String(diagnostics).matchAll(
+    /\[PAUSE_PRECHECK:(METRICS_CHANGED|REPORT_CONTEXT_MISMATCH|TARGET_NOT_ACTIVE|READ_TIMEOUT)\]/g,
+  )].map(match => match[1]) : [];
+  if (new Set(markers).size === 1) {
+    error.code = 'PAUSE_PRECHECK_REJECTED';
+    error.reason = pausePrecheckReasons[markers[0]];
+    error.writeAttempted = false;
+    error.operationSettled = true;
+    error.message = `Pause precheck rejected (${error.reason}); no write was attempted`;
+    return error;
+  }
   if (authenticationErrorPatterns.some(pattern => pattern.test(String(diagnostics)))) {
     error.code = 'AUTH_REQUIRED';
     error.authRequired = true;
@@ -39,10 +66,28 @@ function opencliFailure(message, diagnostics = '') {
   return error;
 }
 
+export function parseSettledTargets(value) {
+  if (value === undefined) return [];
+  let targets;
+  try { targets = JSON.parse(value); } catch { throw new Error('--settled-targets must be a non-empty JSON array'); }
+  const fields = ['profile', 'promotionType', 'campaignId'];
+  if (!Array.isArray(targets) || !targets.length || targets.some(target => !target || typeof target !== 'object'
+      || Array.isArray(target) || Object.keys(target).some(key => !fields.includes(key))
+      || fields.some(field => typeof target[field] !== 'string' || !target[field].trim()
+        || target[field] !== target[field].trim()) || !promotionTypes.has(target.promotionType))) {
+    throw new Error('--settled-targets requires exact non-empty profile, promotionType and campaignId strings');
+  }
+  if (new Set(targets.map(target => JSON.stringify(fields.map(field => target[field])))).size !== targets.length) {
+    throw new Error('--settled-targets contains duplicate campaign identities');
+  }
+  return targets;
+}
+
 export function parseArgs(args) {
   const options = { mode: 'report', configPath: path.join(root, 'config.json'), auditDir: path.join(root, 'audit') };
   const keys = { '--mode': 'mode', '--config': 'configPath', '--audit-dir': 'auditDir',
-    '--recover': 'recover', '--finalize': 'finalize', '--settled-profiles': 'settledProfiles' };
+    '--recover': 'recover', '--finalize': 'finalize', '--settled-profiles': 'settledProfiles',
+    '--settled-targets': 'settledTargets' };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--help') return { help: true };
     if (args[i] === '--retry-pauses') { options.retryPauses = true; continue; }
@@ -54,7 +99,10 @@ export function parseArgs(args) {
   }
   if (!['report', 'dry-run', 'execute'].includes(options.mode)) throw new Error('mode must be report, dry-run, or execute');
   if (options.recover && options.finalize) throw new Error('Choose recover or finalize');
-  if ((options.retryPauses || options.settledProfiles) && !options.recover) throw new Error('Retry options require --recover');
+  if ((options.retryPauses || options.settledProfiles || options.settledTargets !== undefined) && !options.recover) {
+    throw new Error('Retry options require --recover');
+  }
+  parseSettledTargets(options.settledTargets);
   for (const id of [options.recover, options.finalize].filter(Boolean)) {
     if (!/^[\w-]+$/.test(id)) throw new Error('Invalid audit run ID');
   }
@@ -131,7 +179,8 @@ export function createOpencli(env) {
     // Do not copy browser traces or arbitrary stderr (which may contain session data) into audit files.
     const diagnostics = `${proc.stdout || ''}\n${proc.stderr || ''}`;
     if (proc.error) throw opencliFailure(`OpenCLI process failed (${proc.error.code || 'unknown'}); inspect its local trace`, diagnostics);
-    if (proc.status !== 0) throw opencliFailure(`OpenCLI exited with status ${proc.status}; inspect its local trace`, diagnostics);
+    if (proc.status !== 0) throw opencliFailure(`OpenCLI exited with status ${proc.status}; inspect its local trace`, diagnostics,
+      args.some((arg, index) => arg === 'alimama' && args[index + 1] === 'pause-campaign'));
     try { return JSON.parse(proc.stdout); }
     catch { throw new Error('OpenCLI returned invalid JSON'); }
   };
@@ -178,6 +227,9 @@ export function validateVerification(rows, identity, targets) {
 export const targetArgs = rows => ['--targets', JSON.stringify(rows.map(row => ({ promotionType: row.promotionType,
   campaignId: row.campaignId, campaignName: row.campaignName })))];
 
+export const reportContextArgs = row => row.reportContext === undefined
+  ? [] : ['--report-context', JSON.stringify(row.reportContext)];
+
 export const targetGroups = rows => ['全站推', '关键词推广']
   .map(promotionType => rows.filter(row => row.promotionType === promotionType))
   .filter(rowsOfType => rowsOfType.length);
@@ -219,6 +271,7 @@ export async function sendWeChat(webhook, content) {
 
 // Lock audit mutations and recovery writes across processes, including notification finalization.
 export async function run(options, dependencies = {}) {
+  if (options.settledTargets !== undefined && !options.recover) throw new Error('--settled-targets requires --recover');
   fs.mkdirSync(options.auditDir, { recursive: true });
   const lockPath = path.join(options.auditDir, 'runner.lock');
   let lock;
@@ -294,11 +347,10 @@ async function runUnlocked(options, dependencies) {
   if (!state.paused || typeof state.paused !== 'object' || Array.isArray(state.paused)) throw new Error('Invalid pause state file');
   state.pending ||= {};
   if (typeof state.pending !== 'object' || Array.isArray(state.pending)) throw new Error('Invalid pending state file');
-  // Pending writes are isolated by promotion plan. A stale/uncertain plan must
-  // not suppress independent eligible plans from the same shop profile.
-  const blockedKeys = new Set(Object.keys(state.pending));
-  const inheritedBlockedKeys = new Set(blockedKeys);
-  const pendingRuns = [...new Set(Object.values(state.pending).map(row => row.runId).filter(Boolean))];
+  // Each execute run is a fresh decision. Historical pending entries remain
+  // audit evidence only; they never suppress a newly verified action list.
+  const blockedKeys = new Set();
+  const notWrittenKeys = new Set();
   const results = [], failures = [], closeResults = [], pauseReadbacks = [], shops = [], seen = new Set(), pauseAttempts = [];
   const authBlockedProfiles = new Set();
   const configSnapshot = { profiles: config.profiles, allowedBrowserUsers: config.allowedBrowserUsers,
@@ -348,7 +400,7 @@ async function runUnlocked(options, dependencies) {
         '--promotion-type', row.promotionType === '关键词推广' ? 'keyword' : 'all-site',
         '--campaign-id', row.campaignId, '--expected-shop', identity.expectedAlimamaShop,
         '--expected-name', row.campaignName, '--max-roi', String(config.thresholds.closeRoiBelow),
-        '--min-charge', String(config.thresholds.closeChargeAbove), ...pagination,
+        '--min-charge', String(config.thresholds.closeChargeAbove), ...reportContextArgs(row), ...pagination,
         ...commandTimeout, '--execute', '--trace', 'retain-on-failure', ...lifecycle.map((value, index) => lifecycle[index - 1] === '--site-session' ? 'persistent' : value)]);
       const result = Array.isArray(raw) && raw.length === 1 ? raw[0] : raw;
       if (result?.ok !== true || result.verified !== true || result.shopName !== identity.expectedAlimamaShop
@@ -365,10 +417,21 @@ async function runUnlocked(options, dependencies) {
       closeResults.push(verified);
       pauseAttempts.at(-1).status = 'verified';
     } catch (error) {
-      pauseAttempts.at(-1).status = 'uncertain';
+      const notWritten = isPausePrecheckRejected(error);
+      if (typeof error.pageClosed === 'boolean') pauseAttempts.at(-1).pageClosed = error.pageClosed;
+      if (notWritten) {
+        Object.assign(pauseAttempts.at(-1), { status: 'not-written', reason: error.reason,
+          writeAttempted: false, operationSettled: true });
+        notWrittenKeys.add(keyOf(row));
+        if (state.pending[keyOf(row)]?.runId === runId) delete state.pending[keyOf(row)];
+        atomicJson(statePath, state);
+      } else pauseAttempts.at(-1).status = 'uncertain';
       if (isAuthenticationError(error)) authBlockedProfiles.add(row.profile);
       blockedKeys.add(keyOf(row));
-      failures.push({ profile: row.profile, browserUser: row.browserUser, type: 'pause', campaignId: row.campaignId,
+      failures.push({ profile: row.profile, browserUser: row.browserUser, type: 'pause',
+        promotionType: row.promotionType, campaignId: row.campaignId,
+        ...(typeof error.pageClosed === 'boolean' ? { pageClosed: error.pageClosed } : {}),
+        ...(notWritten ? { reason: error.reason, writeAttempted: false, operationSettled: true } : {}),
         ...(isAuthenticationError(error) ? { reason: 'auth-required', retryable: false } : {}), message: error.message });
     }
     checkpoint({ type: 'pause', profile: row.profile, campaignId: row.campaignId, done: true });
@@ -451,23 +514,20 @@ async function runUnlocked(options, dependencies) {
   }
 
   const payload = { runAt: new Date().toISOString(), runId, mode: options.mode, configSnapshot, scanned: results.length,
-    shops, lowRoi, toClose, closeResults, pauseReadbacks, failures, pauseAttempts, pendingRuns,
+    shops, lowRoi, toClose, closeResults, pauseReadbacks, failures, pauseAttempts,
     notification: { status: options.mode === 'report' ? 'disabled' : 'not-needed', sent: 0 } };
   if (options.mode !== 'report') {
     const { unresolvedItems } = await import('./recovery.mjs');
     const unresolved = unresolvedItems(payload, config);
-    if (options.mode === 'execute' && pendingRuns.length) {
-      unresolved.push(...pendingRuns.map(id => ({ type: 'prior-run', runId: id })));
-    }
     if (unresolved.length) {
       payload.recovery = { status: 'awaiting-agent', rounds: 0, unresolved };
       payload.notification.status = 'awaiting-agent';
       if (options.mode === 'execute') {
         for (const row of toClose) {
-          if (inheritedBlockedKeys.has(keyOf(row))) continue;
+          if (notWrittenKeys.has(keyOf(row))) continue;
           if (!unresolved.some(item => item.profile === row.profile && item.campaignId === row.campaignId
             && item.promotionType === row.promotionType)) continue;
-          state.pending[keyOf(row)] ||= { ...row, runId, status: 'awaiting-agent' };
+          state.pending[keyOf(row)] = { ...row, runId, status: 'awaiting-agent' };
         }
         atomicJson(statePath, state);
       }
@@ -502,7 +562,7 @@ async function runUnlocked(options, dependencies) {
 async function main() {
   try {
     const options = parseArgs(process.argv.slice(2));
-    if (options.help) console.log('node runner.mjs [--mode report|dry-run|execute] [--config FILE] [--audit-dir DIR]\nnode runner.mjs --recover RUN_ID [--retry-pauses --settled-profiles PROFILE,PROFILE]\nnode runner.mjs --finalize RUN_ID\nDefault: report. Recovery reads only unless an agent explicitly enables a guarded retry. Finalize sends saved results only.');
+    if (options.help) console.log('node runner.mjs [--mode report|dry-run|execute] [--config FILE] [--audit-dir DIR]\nnode runner.mjs --recover RUN_ID [--retry-pauses] [--settled-targets JSON] [--settled-profiles PROFILE,PROFILE]\nnode runner.mjs --finalize RUN_ID\n--settled-targets: non-empty JSON array of {profile,promotionType,campaignId}; confirms only those old operations ended.\n--settled-profiles: legacy confirmation that every old operation in each listed profile ended.\nDefault: report. Recovery reads only unless an agent explicitly enables a guarded retry. Finalize sends saved results only.');
     else {
       const payload = await run(options);
       console.log(JSON.stringify(payload, null, 2));

@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { active, atomicJson, commandTimeoutArgs, createOpencli, keyOf, selectCampaigns, sendWeChat,
-  targetArgs, targetGroups, validateConfig, validateScan, validateVerification, isAuthenticationError } from './runner.mjs';
+  targetArgs, targetGroups, reportContextArgs, validateConfig, validateScan, validateVerification,
+  isAuthenticationError, isPausePrecheckRejected, parseSettledTargets } from './runner.mjs';
 import { buildMessages } from './messages.mjs';
 
 const lifecycle = ['-f', 'json', '--window', 'background', '--site-session', 'ephemeral', '--keep-tab', 'false'];
@@ -127,9 +128,21 @@ export async function recoverAudit(options, currentConfig, dependencies = {}) {
   // Recover reads are always safe to request. A second write requires the agent to have
   // positively established that the old page operation ended; an empty lease is insufficient.
   const settled = new Set((options.settledProfiles || '').split(',').filter(Boolean));
-  if (options.retryPauses && !settled.size) throw new Error('Retry requires --settled-profiles after agent inspection of old operations');
+  const settledTargets = parseSettledTargets(options.settledTargets);
+  const settledKeys = new Set(settledTargets.map(keyOf));
+  const operationSettled = row => settled.has(row.profile) || settledKeys.has(keyOf(row));
+  if (options.retryPauses && !settled.size && !settledKeys.size) {
+    throw new Error('Retry requires --settled-targets or --settled-profiles after agent inspection of old operations');
+  }
   for (const profile of settled) {
     if (!config.profiles.some(identity => identity.profile === profile)) throw new Error('Unknown settled profile');
+  }
+  if (settledTargets.some(target => !config.profiles.some(identity => identity.profile === target.profile))) {
+    throw new Error('Unknown settled target profile');
+  }
+  const candidateKeys = new Set(payload.toClose.map(keyOf));
+  if (settledTargets.some(target => !candidateKeys.has(keyOf(target)))) {
+    throw new Error('Settled target is not a candidate in this audit; recover read-only before confirming new candidates');
   }
   if (options.retryPauses && payload.mode !== 'execute') throw new Error('Only execute audits may retry pauses');
   if (['sending', 'failed'].includes(payload.notification?.status)) throw new Error('Resolve uncertain notification delivery before changing its audit');
@@ -145,9 +158,13 @@ export async function recoverAudit(options, currentConfig, dependencies = {}) {
   state.pending ||= {};
   if (typeof state.paused !== 'object' || Array.isArray(state.paused)
       || typeof state.pending !== 'object' || Array.isArray(state.pending)) throw new Error('Invalid recovery state file');
-  const foreignPendingKeys = new Set(Object.entries(state.pending)
-    .filter(([, item]) => item.runId !== payload.runId).map(([key]) => key));
   const authBlockedProfiles = new Set();
+  const notWrittenKeys = new Set();
+  for (const attempt of payload.pauseAttempts) {
+    if (attempt.status === 'not-written' && attempt.writeAttempted === false && attempt.operationSettled === true) {
+      notWrittenKeys.add(keyOf(attempt));
+    } else notWrittenKeys.delete(keyOf(attempt));
+  }
   const saveState = () => { if (payload.mode === 'execute') atomicJson(statePath, state); };
   payload.recovery.rounds = (payload.recovery.rounds || 0) + 1;
   payload.recovery.status = 'recovering';
@@ -210,15 +227,17 @@ export async function recoverAudit(options, currentConfig, dependencies = {}) {
         delete state.paused[key];
         if (outcome === 'active' && Number.isFinite(current.roi) && Number.isFinite(current.charge)
             && !selectCampaigns([current], config.thresholds).toClose.length) delete state.pending[key];
-        else if (alreadySent && settled.has(identity.profile) && outcome === 'active'
+        else if (alreadySent && operationSettled(row) && outcome === 'active'
             && state.pending[key]?.runId === payload.runId) {
           // The old attempt is demonstrably over and the current status is explicit.
           // Release its write gate; a later authorized run must build its own fresh action list.
           delete state.pending[key];
           (payload.recovery.released ||= []).push({ key, at: stamp(), outcome });
         }
-        else if (!alreadySent && !foreignPendingKeys.has(key)
-          && (!state.pending[key] || state.pending[key].runId === payload.runId)) {
+        else if (notWrittenKeys.has(key)) {
+          if (state.pending[key]?.runId === payload.runId) delete state.pending[key];
+        }
+        else if (!alreadySent) {
           state.pending[key] = { ...row, runId: payload.runId, status: outcome };
         }
       }
@@ -271,19 +290,19 @@ export async function recoverAudit(options, currentConfig, dependencies = {}) {
       candidates = payload.toClose.filter(row => row.profile === identity.profile);
       reconcile(identity, candidates, rows);
     }
-    if (!options.retryPauses || !settled.has(identity.profile) || authBlockedProfiles.has(identity.profile)) continue;
+    if (!options.retryPauses || authBlockedProfiles.has(identity.profile)) continue;
     let attempted = false;
     for (const row of candidates) {
       const key = keyOf(row);
+      if (!operationSettled(row)) continue;
       const latest = latestOutcome(payload, row);
       if (latest.outcome !== 'active' || !selectCampaigns([latest.current], config.thresholds).toClose.length) continue;
       if (payload.recovery.retryCounts[key]) continue;
-      const foreignPending = Object.entries(state.pending)
-        .find(([pendingKey, item]) => pendingKey === key && item.runId !== payload.runId);
-      if (foreignPending) { payload.recovery.blockedByRun = foreignPending.runId; persist(); continue; }
       // Persist budget and intent before the call. A crash never grants another retry.
       payload.recovery.retryCounts[key] = 1;
-      payload.pauseAttempts.push({ ...row, status: 'pending', recovery: true, at: stamp(), agentConfirmedSettled: true });
+      notWrittenKeys.delete(key);
+      payload.pauseAttempts.push({ ...row, status: 'pending', recovery: true, at: stamp(), agentConfirmedSettled: true,
+        settlementScope: settledKeys.has(key) ? 'target' : 'profile' });
       state.pending[key] = { ...row, runId: payload.runId, status: 'pending', recoveryAttempted: true };
       persist(); saveState();
       attempted = true;
@@ -292,7 +311,7 @@ export async function recoverAudit(options, currentConfig, dependencies = {}) {
           '--promotion-type', row.promotionType === '关键词推广' ? 'keyword' : 'all-site',
           '--campaign-id', row.campaignId, '--expected-shop', identity.expectedAlimamaShop,
           '--expected-name', row.campaignName, '--max-roi', String(config.thresholds.closeRoiBelow),
-          '--min-charge', String(config.thresholds.closeChargeAbove), ...pagination,
+          '--min-charge', String(config.thresholds.closeChargeAbove), ...reportContextArgs(latest.current), ...pagination,
           ...commandTimeout, '--execute', '--trace', 'retain-on-failure', ...lifecycle.map((value, index) => lifecycle[index - 1] === '--site-session' ? 'persistent' : value)]);
         const result = Array.isArray(raw) && raw.length === 1 ? raw[0] : raw;
         if (result?.ok !== true || !stopped(result) || result.writeAttempted !== true
@@ -302,12 +321,24 @@ export async function recoverAudit(options, currentConfig, dependencies = {}) {
         }
         payload.pauseAttempts.at(-1).status = 'verified';
       } catch (error) {
-        payload.pauseAttempts.at(-1).status = 'uncertain';
+        const notWritten = isPausePrecheckRejected(error);
+        if (typeof error.pageClosed === 'boolean') payload.pauseAttempts.at(-1).pageClosed = error.pageClosed;
+        if (notWritten) {
+          Object.assign(payload.pauseAttempts.at(-1), { status: 'not-written', reason: error.reason,
+            writeAttempted: false, operationSettled: true });
+          notWrittenKeys.add(key);
+          if (state.pending[key]?.runId === payload.runId) delete state.pending[key];
+          saveState();
+        } else payload.pauseAttempts.at(-1).status = 'uncertain';
         if (isAuthenticationError(error)) authBlockedProfiles.add(identity.profile);
-        payload.failures.push({ profile: row.profile, type: 'pause', campaignId: row.campaignId,
+        payload.failures.push({ profile: row.profile, type: 'pause', promotionType: row.promotionType, campaignId: row.campaignId,
+          ...(typeof error.pageClosed === 'boolean' ? { pageClosed: error.pageClosed } : {}),
+          ...(notWritten ? { reason: error.reason, writeAttempted: false, operationSettled: true } : {}),
           ...(isAuthenticationError(error) ? { reason: 'auth-required', retryable: false } : {}), message: error.message, at: stamp() });
         persist();
-        break; // Other shops continue; this shop gets a read-only check, never another blind write.
+        if (authBlockedProfiles.has(identity.profile)) break;
+        // Each other plan still needs its own settled evidence and guarded write.
+        continue;
       }
       persist();
     }

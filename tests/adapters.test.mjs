@@ -4,7 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 // The registry and browser are mocked. These tests never start OpenCLI or perform a write online.
-function loadAdapter(name) {
+function loadAdapter(name, { hostWaits = [], hostErrors = [] } = {}) {
   const registrations = [];
   const source = readFileSync(new URL(`../adapters/${name}.js`, import.meta.url), 'utf8')
     .replace(/^import .* from '@jackwener\/opencli\/registry';\r?\n/m, '')
@@ -13,6 +13,8 @@ function loadAdapter(name) {
     cli: definition => registrations.push(definition),
     Strategy: { PAGE_FETCH: 'PAGE_FETCH', DOM_STATE: 'DOM_STATE' },
     URL,
+    setTimeout: (callback, milliseconds) => { hostWaits.push(milliseconds); callback(); },
+    console: { error: (...values) => { hostErrors.push(values.join(' ')); } },
   }, { filename: `${name}.js` });
   assert.equal(registrations.length, 1);
   return registrations[0];
@@ -42,9 +44,9 @@ const reportCondition = {
   isRt: true,
 };
 
-function harness({ rows = [campaign()], shop = 'Example shop', onRead, onWrite, fallbackOnly = false, initialUrl = '',
+function harness({ rows = [campaign()], shop = 'Example shop', onRead, onWrite, fallbackOnly = false, initialUrl = '', frozenTimers = false,
   domDialogs = [], submitParams = { rptQuery: { conditionList: [reportCondition], fields: 'charge' } } } = {}) {
-  const state = { rows, shop, reads: [], writes: [], navigation: [], waits: [], dialogs: [], keys: [] };
+  const state = { rows, shop, reads: [], writes: [], navigation: [], waits: [], dialogs: [], keys: [], closedTabs: [] };
   const location = { hostname: 'one.alimama.com', href: initialUrl };
   const view = {
     updater: {
@@ -84,10 +86,18 @@ function harness({ rows = [campaign()], shop = 'Example shop', onRead, onWrite, 
     document: { querySelectorAll: () => domDialogs },
     location,
     URL,
-    setTimeout: (callback, milliseconds) => { state.waits.push(milliseconds); callback(); },
+    setTimeout: (callback, milliseconds) => {
+      if (frozenTimers) throw new Error('Background page timers are suspended');
+      state.waits.push(milliseconds); callback();
+    },
   });
   const navigate = method => async url => { state.navigation.push({ method, url }); location.href = url; };
   const page = {
+    newTab: async url => { await navigate('newTab')(url); return 'owned-pause-tab'; },
+    setActivePage: target => { state.activeTab = target; },
+    closeTab: async target => { state.closedTabs.push(target); },
+    tabs: async () => state.activeTab && !state.closedTabs.includes(state.activeTab)
+      ? [{ page: state.activeTab, url: location.href }] : [],
     navigate: navigate('navigate'),
     getCurrentUrl: async () => location.href || null,
     handleJavaScriptDialog: async accept => { state.dialogs.push(accept); },
@@ -149,7 +159,7 @@ test('scan uses both active statuses and preserves raw metric precision for deci
   assert.equal(result[1].charge, 30.00001);
   assert.equal(state.navigation.length, 2);
   assert.ok(state.navigation.every(item => item.method === 'goto'));
-  assert.deepEqual(state.waits, [4000, 4000]);
+  assert.deepEqual(state.waits, []);
   assert.ok(state.reads.every(item => item.statusList.join(',') === 'start'));
   assert.ok(state.reads[0].rptQuery.fields.includes('retainedRoi'));
   assert.ok(state.reads[2].rptQuery.fields.includes('roi'));
@@ -382,24 +392,81 @@ test('scan and pause wait for a current report context instead of failing on an 
     const { page, state } = harness({ submitParams });
     if (adapter === scan) await adapter.func(page, targetArgs());
     else await adapter.func(page, { 'promotion-type': 'all-site', 'campaign-id': 'target' });
-    assert.deepEqual(state.waits, [4000, 500, 500]);
+    assert.deepEqual(state.waits, []);
   }
 });
 
-test('pause reuses an exact current route instead of navigating the persistent tab again', async () => {
+test('scan waits in Node and completes both promotion pages when page timers cannot run', async () => {
+  const hostWaits = [];
+  const adapter = loadAdapter('scan-campaigns', { hostWaits });
+  const readiness = new Map();
+  const { page, state } = harness({ frozenTimers: true, submitParams: location => {
+    const attempts = (readiness.get(location.href) || 0) + 1;
+    readiness.set(location.href, attempts);
+    return { rptQuery: { conditionList: [attempts < 3 ? {} : reportCondition], fields: 'charge' } };
+  } });
+  const result = await adapter.func(page, {});
+  assert.deepEqual(hostWaits, [4000, 500, 500, 4000, 500, 500]);
+  assert.deepEqual(state.waits, []);
+  assert.equal(state.reads.length, 2);
+  assert.equal(state.writes.length, 0);
+  assert.equal(result.length, 3);
+  assert.ok(result.slice(1).every(row => row.reportContext.startTime === reportCondition.startTime));
+});
+
+test('target scan bounds readiness polling to 20 attempts without issuing a query', async () => {
+  const hostWaits = [];
+  const adapter = loadAdapter('scan-campaigns', { hostWaits });
+  let attempts = 0;
+  const { page, state } = harness({ frozenTimers: true, submitParams: () => {
+    attempts++;
+    return { rptQuery: { conditionList: [{}] } };
+  } });
+  await assert.rejects(adapter.func(page, targetArgs()), /^Error: all-site campaign list is not ready$/);
+  assert.equal(attempts, 20);
+  assert.deepEqual(hostWaits, [4000, ...Array(19).fill(500)]);
+  assert.equal(state.reads.length, 0);
+  assert.equal(state.navigation.length, 1);
+});
+
+test('scan never repeats query, identity or pagination failures as readiness polling', async () => {
+  for (const scenario of [
+    { onRead: () => { throw new Error('network timeout'); }, expected: /network timeout/, reads: 1 },
+    { onRead: () => { throw new Error('all-site campaign list is not ready'); }, expected: /Campaign query failed/, reads: 1 },
+    { onRead: () => ({ info: { message: 'all-site campaign list is not ready' } }), expected: /Campaign query failed/, reads: 1 },
+    { onRead: (_params, state) => { state.shop = 'Another shop'; return { data: { list: [campaign()], count: 1 } }; },
+      expected: /identity changed/, reads: 1 },
+    { onRead: params => ({ data: { list: [campaign({ campaignId: String(params.offset) })], count: params.offset ? 3 : 2 } }),
+      args: { 'page-size': 1 }, expected: /count changed/, reads: 2 },
+  ]) {
+    const hostWaits = [];
+    const adapter = loadAdapter('scan-campaigns', { hostWaits });
+    const { page, state } = harness({ onRead: scenario.onRead, frozenTimers: true });
+    await assert.rejects(adapter.func(page, scenario.args || {}), scenario.expected);
+    assert.deepEqual(hostWaits, [4000]);
+    assert.equal(state.reads.length, scenario.reads);
+    assert.equal(state.navigation.length, 1);
+    assert.equal(state.writes.length, 0);
+  }
+});
+
+test('pause isolates a fresh page even when the persistent tab already has the requested route', async () => {
   const { page, state } = harness({ initialUrl: 'https://one.alimama.com/index.html#!/manage/onesite?from=recovery' });
   await pause.func(page, { 'promotion-type': 'all-site', 'campaign-id': 'target' });
-  assert.equal(state.navigation.length, 0);
+  assert.equal(state.navigation.length, 1);
+  assert.equal(state.navigation[0].method, 'newTab');
+  assert.equal(state.activeTab, 'owned-pause-tab');
+  assert.deepEqual(state.closedTabs, ['owned-pause-tab']);
   assert.equal(state.reads.length, 1);
 });
 
-test('pause navigates normally when the bridge cannot read the current URL', async () => {
+test('pause creates its page without depending on a stale current URL read', async () => {
   const { page, state } = harness();
   page.getCurrentUrl = async () => { throw new Error('transient bridge read failure'); };
   const result = await pause.func(page, { 'promotion-type': 'all-site', 'campaign-id': 'target' });
   assert.equal(result.writeAttempted, false);
   assert.deepEqual(state.navigation, [{
-    method: 'goto', url: 'https://one.alimama.com/index.html#!/manage/onesite',
+    method: 'newTab', url: 'https://one.alimama.com/index.html#!/manage/onesite',
   }]);
   assert.equal(state.reads.length, 1);
   assert.equal(state.writes.length, 0);
@@ -415,7 +482,7 @@ test('pause does not accept a lookalike host or route when deciding to skip navi
     await pause.func(page, { 'promotion-type': 'all-site', 'campaign-id': 'target' });
     assert.equal(state.navigation.length, 1);
     assert.deepEqual(state.navigation[0], {
-      method: 'goto', url: 'https://one.alimama.com/index.html#!/manage/onesite',
+      method: 'newTab', url: 'https://one.alimama.com/index.html#!/manage/onesite',
     });
   }
 });
@@ -427,13 +494,14 @@ test('pause queries only its exact ID before and after one write, without traver
   assert.equal(result.verified, true);
   assert.equal(result.afterStatus, 'pause');
   assert.equal(result.campaignId, 'target');
+  assert.equal(result.cleanup.pageClosed, true);
   assert.equal(state.writes.length, 1);
   assert.equal(state.writes[0].name, 'campaign_updatePart_post');
   assert.equal(state.writes[0].params.campaignList[0].displayStatus, 'pause');
   assert.equal(state.writes[0].params.campaignList[0].campaignId, 'target');
   assert.deepEqual(state.reads.map(item => item.offset), [0, 0]);
   assert.ok(state.reads.every(item => item.campaignId === 'target' && item.pageSize === 2));
-  assert.deepEqual(state.waits, [4000, 1200]);
+  assert.deepEqual(state.waits, []);
   assert.equal(state.navigation.length, 1);
 });
 
@@ -516,6 +584,115 @@ test('pause verifies an explicit paused and offline target returned by the targe
 test('pause never retries an uncertain write', async () => {
   const { page, state } = harness({ onWrite: () => { throw new Error('network timeout'); } });
   await assert.rejects(pause.func(page, executeArgs()), /outcome uncertain; do not retry write/);
+  assert.equal(state.writes.length, 1);
+  assert.deepEqual(state.closedTabs, ['owned-pause-tab']);
+});
+
+test('pause cleanup failure preserves a verified pause and reports no private error details', async () => {
+  const hostErrors = [];
+  const adapter = loadAdapter('pause-campaign', { hostErrors });
+  const { page, state } = harness();
+  page.closeTab = async target => {
+    state.closedTabs.push(target);
+    throw new Error('private cleanup');
+  };
+  const result = await adapter.func(page, executeArgs());
+  assert.equal(result.verified, true);
+  assert.equal(result.cleanup.pageClosed, false);
+  assert.equal(state.writes.length, 1);
+  assert.deepEqual(state.closedTabs, ['owned-pause-tab']);
+  assert.ok(hostErrors.includes('[PAUSE_PAGE:CLOSE_FAILED]'));
+  assert.doesNotMatch(JSON.stringify(result) + hostErrors.join('\n'), /private cleanup/);
+});
+
+test('pause cleanup failure preserves a precheck rejection and an uncertain write error', async () => {
+  for (const scenario of [
+    { rows: [campaign({ reportInfoList: [{ retainedRoi: 1.5, charge: 100 }] })],
+      expected: /PAUSE_PRECHECK:METRICS_CHANGED/, writes: 0 },
+    { onWrite: () => { throw new Error('original write timeout'); },
+      expected: /Pause outcome uncertain.*original write timeout/, writes: 1 },
+  ]) {
+    const hostErrors = [];
+    const adapter = loadAdapter('pause-campaign', { hostErrors });
+    const { page, state } = harness(scenario);
+    page.closeTab = async target => {
+      state.closedTabs.push(target);
+      throw new Error('private cleanup');
+    };
+    await assert.rejects(adapter.func(page, executeArgs()), error => {
+      assert.match(error.message, scenario.expected);
+      assert.doesNotMatch(error.message, /private cleanup/);
+      return true;
+    });
+    assert.equal(state.writes.length, scenario.writes);
+    assert.deepEqual(state.closedTabs, ['owned-pause-tab']);
+    assert.ok(hostErrors.includes('[PAUSE_PAGE:CLOSE_FAILED]'));
+    assert.doesNotMatch(hostErrors.join('\n'), /private cleanup/);
+  }
+});
+
+test('pause fails closed when a dedicated page cannot be identified', async () => {
+  for (const missing of ['newTab', 'setActivePage', 'closeTab', 'tabs']) {
+    const { page, state } = harness();
+    delete page[missing];
+    await assert.rejects(pause.func(page, executeArgs()), /lifecycle API is unavailable/);
+    assert.equal(state.writes.length, 0);
+    assert.equal(state.navigation.length, 0);
+  }
+  const { page, state } = harness();
+  page.newTab = async () => undefined;
+  await assert.rejects(pause.func(page, executeArgs()), /did not identify/);
+  assert.equal(state.writes.length, 0);
+  assert.deepEqual(state.closedTabs, []);
+});
+
+test('pause completes one write and verification even when background page timers cannot run', async () => {
+  let readinessReads = 0;
+  const { page, state } = harness({ frozenTimers: true,
+    submitParams: () => ++readinessReads < 3 ? { rptQuery: { conditionList: [{}] } }
+      : { rptQuery: { conditionList: [reportCondition], fields: 'charge' } },
+  });
+  const result = await pause.func(page, executeArgs());
+  assert.equal(result.verified, true);
+  assert.equal(state.writes.length, 1);
+  assert.equal(state.reads.length, 2);
+  assert.deepEqual(state.waits, []);
+});
+
+test('scan report context pins pause and verification to the scan date instead of a stale persistent page', async () => {
+  const scanning = harness({ submitParams: { rptQuery: { fields: 'charge', conditionList: [
+    { ...reportCondition, csrfId: 'must-not-export', loginPointId: 'must-not-export' },
+  ] } } });
+  const rows = await scan.func(scanning.page, targetArgs());
+  const context = rows.find(row => row.recordType === 'verification').reportContext;
+  assert.deepEqual(JSON.parse(JSON.stringify(context)), reportCondition);
+  const stale = { ...reportCondition, startTime: '2026-09-13', endTime: '2026-09-13' };
+  const { page, state } = harness({ submitParams: { rptQuery: { fields: 'charge', conditionList: [stale] } },
+    onRead: (params, state) => ({ data: { count: 1, list: [
+      { ...state.rows[0], reportInfoList: [{ charge: 31, retainedRoi:
+        params.rptQuery.conditionList[0].startTime === reportCondition.startTime ? 1.2 : 7.5 }] },
+    ] } }),
+  });
+  const result = await pause.func(page, executeArgs({ 'report-context': JSON.stringify(context) }));
+  assert.equal(result.verified, true);
+  assert.equal(state.writes.length, 1);
+  assert.ok(state.reads.every(params => params.rptQuery.conditionList[0].startTime === reportCondition.startTime));
+});
+
+test('pause rejects malformed or non-allowlisted scan report context without writing', async () => {
+  for (const context of ['broken', 'null', '[]', JSON.stringify({ ...reportCondition, csrfId: 'secret' }),
+    JSON.stringify({ ...reportCondition, startTime: 'invalid' })]) {
+    const { page, state } = harness();
+    await assert.rejects(pause.func(page, executeArgs({ 'report-context': context })), /PAUSE_PRECHECK:REPORT_CONTEXT_MISMATCH/);
+    assert.equal(state.writes.length, 0);
+  }
+});
+
+test('serialized keyword report context preserves omitted attribution defaults', async () => {
+  const condition = { ...reportCondition, effectEqual: undefined, unifyType: undefined };
+  const { page, state } = harness({ submitParams: { rptQuery: { fields: 'charge', conditionList: [condition] } } });
+  const result = await pause.func(page, executeArgs({ 'promotion-type': 'keyword', 'report-context': JSON.stringify(condition) }));
+  assert.equal(result.verified, true);
   assert.equal(state.writes.length, 1);
 });
 

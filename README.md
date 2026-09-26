@@ -19,7 +19,8 @@ qianniu-promotion-monitor/
 │   └── whoami.js              手工核对页面身份
 ├── scripts/
 │   ├── install.mjs            安装 Skill 和 OpenCLI 适配器
-│   └── check.mjs              本地依赖、配置和源码一致性检查
+│   ├── check.mjs              本地依赖、配置和源码一致性检查
+│   └── diagnose.mjs           只读提取 trace 的脱敏错误类别和报表日期
 └── tests/                     不连接浏览器或企业微信的离线测试
 ```
 
@@ -89,14 +90,16 @@ node scripts/install.mjs --config <旧目录>/config.json --audit-from <旧目�
 | `node runner.mjs --mode dry-run` | 按用户要求发送最终提醒和待暂停清单，不暂停 |
 | `node runner.mjs --mode execute` | 仅在用户明确授权后使用；运行器负责复核、执行、核验和最终通知 |
 | `node runner.mjs --recover RUN_ID` | agent 接管异常后的只读核验，不暂停、不通知 |
-| `node runner.mjs --recover RUN_ID --retry-pauses --settled-profiles PROFILE` | agent 确认旧操作结束后，重新核验再受控重试，每计划最多一次 |
+| `node runner.mjs --recover RUN_ID --retry-pauses --settled-targets JSON` | agent 按计划确认旧操作结束后，重新核验再受控重试，每计划最多一次；JSON 格式见[异常恢复](references/recovery.md) |
 | `node runner.mjs --finalize RUN_ID` | 仅从该轮最终审计发送结果，不重扫、不重写 |
 
 通知先按店铺展示低 ROI 巡检结果，最后集中发送“暂停操作汇总”。“待暂停”是该轮筛选出的完整执行清单，“已暂停”是最终核验确认停用的子集，不把失败数或剩余数称作待暂停；不再使用“推广未暂停”及其计数。使用 `# / ## / ###` 层级和绿色已暂停、橙色待暂停、灰色指标，零值隐藏。候选保留在待暂停阶段，核验成功的同时出现在已暂停阶段，便于对照。没有候选时明确说明。技术错误、trace 和归因信息只保存在本地审计。
 
 可以用 `--config <文件>`、`--audit-dir <目录>` 指定本地配置和结果位置。异常时 runner 保存 `awaiting-agent` 并延后通知；当前 agent 依照 [异常恢复](references/recovery.md) 诊断、只读核验，再在符合条件时重试，最后 finalize。直接在终端无人接管地运行 runner 不会自行产生一个模型进程；Codex 自动化通过读取 Skill 完成接管。
 
-执行结果保存到 `audit/<runId>.json`，包括配置快照、店铺结果、原始待暂停清单、最终核验、异常、恢复预算和通知状态。`state.json` 持久保存待核验操作，后续轮次按推广计划隔离写入；`runner.lock` 防止同一审计目录并发执行。未完成 execute 通过 recover 恢复，不直接重跑。同一计划写入异常后停止该计划后续写入，同店其他计划继续串行处理；只有最新核验能决定已暂停集合。
+`--settled-targets` 使用当前轮候选的完整店铺、推广类型和计划 ID；仅确认一条旧操作结束时，只声明这一条。兼容的 `--settled-profiles` 会覆盖所列店铺的全部候选，只有该店所有相关旧操作均已确认结束才可使用。恢复轮数与逐计划写入预算保存在审计中，重复启动命令不会重置。
+
+执行结果保存到 `audit/<runId>.json`，包括配置快照、店铺结果、原始待暂停清单、最终核验、异常、恢复预算和通知状态。`state.json` 保存本轮恢复所需的待核验操作及历史审计，但每次新的 execute 都从实时页面身份、状态和指标重新决策，不受历史 pending 阻断；`runner.lock` 防止同一审计目录并发执行。未完成 execute 通过 recover 恢复，不直接重跑。同一计划写入异常后只停止该轮该计划的后续写入，同店其他计划继续串行处理；只有最新核验能决定已暂停集合。
 
 ## 验证与分享
 
@@ -113,3 +116,7 @@ npm pack --ignore-scripts
 `npm pack` 依据 `package.json.files` 白名单生成可分享 `.tgz`；包名为 `qianniu-promotion-monitor-1.0.0.tgz`。该白名单不包含 `config.json`、`audit/`、`.env`、备份、浏览器 profile 或构建产物。分享通用包即可，收件人自行配置店铺和通知。
 
 适配器依赖阿里妈妈页面的当前运行时；平台变更后应由 agent 先做授权的只读巡检，再维护适配器。安装检查通过不代表线上登录态或页面兼容性已验证。
+
+暂停命令保留 persistent 会话的串行写入锁。开始前若该适配器会话只有一个地址严格为 `about:blank` 的页面，直接将其导航到本次推广页，避免 trace 预先创建的空白页被新建操作遗漏；否则仍新建并绑定专用页面，不复用可能冻结或尚有旧操作的业务页。结束时先核对当前会话页面 ID，再只释放本次操作页，并回查租约是否解除；导航失败也会走同样的收尾。等待和页面就绪重试在 Node 进程中计时；写入返回后单独定向只读核验，不在页面脚本里等待。扫描记录携带不含凭据的报表日期、来源和归因口径 `reportContext`，初始暂停使用该上下文，恢复暂停使用最新核验的上下文，避免持久页面残留前几天的报表设置影响规则判断。明确的写前指标、状态或报表上下文拒绝记为 `not-written`；真正的命令超时仍记为 `uncertain`，两者都按目标计划 ID 回查。
+
+Browser Bridge 默认在最后一个租约释放后保留一个可复用的 `about:blank` 占位页，因此该修复防止暂停操作继续累积多余空白页，不承诺所有窗口都没有空白标签，也不批量清理无法确认归属的历史页面。审计中的 `cleanup.reusedBlank` 表示是否消费了会话空白页；兼容字段 `cleanup.pageClosed` 表示本次操作页租约已解除，不代表物理窗口已关闭。清理失败不覆盖已核验的暂停结果或原始业务错误。
