@@ -1,0 +1,4 @@
+interface:
+  display_name: "千牛推广巡检 · Playwright 版"
+  short_description: "复用千牛独立浏览器，按店巡检推广，授权后暂停并保留审计与恢复记录"
+  default_prompt: "使用 $qianniu-promotion-monitor-playwright 按已登记店铺生成今天的推广巡检报告。"

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+config.json
+shops.json
+.browser-workbench-shops.json
+promotion-config.json
+outputs/
+profiles/
+downloads/
+*.runtime.json
+*.lock
+*.tmp

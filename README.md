@@ -1,5 +1,18 @@
 # 千牛推广巡检：安装、迁移与维护
 
+## 版本入口
+
+| 版本 | Skill 入口 | 浏览器方式 |
+| --- | --- | --- |
+| 新版 Playwright + CDP | [qianniu-promotion-monitor-playwright/SKILL.md](qianniu-promotion-monitor-playwright/SKILL.md) | 复用原生 Edge/Chrome 独立店铺环境，每店处理完保存登录态并关闭 |
+| 原版 OpenCLI | [SKILL.md](SKILL.md) | OpenCLI + Browser Bridge |
+
+新版使用 Python + Playwright，无需 OpenCLI。按店串行巡检、暂停并核验，全部处理结束后发送企微汇总；ROI 和花费空值按 0 参与规则判断。
+
+安装新版时，将 `qianniu-promotion-monitor-playwright/` 整个目录复制到 Codex 的 skills 目录，使用独立名称安装。通知地址填写在该 Skill 内的 `config.json`，从 `config.example.json` 复制后配置；GitHub 仅包含空白模板。店铺登记、依赖安装、运行模式和恢复方法见[新版运行说明](qianniu-promotion-monitor-playwright/references/runbook.md)。
+
+下文介绍原版 OpenCLI 的安装与维护。
+
 这是一个可独立复制的 Codex Skill。它按配置逐店读取阿里妈妈万相台的全站推和关键词推广，生成低 ROI 清单，在用户授权时通知或暂停。主脚本只使用 Node.js 内置模块，没有需要在本目录安装的 npm 运行依赖。
 
 ## 项目结构

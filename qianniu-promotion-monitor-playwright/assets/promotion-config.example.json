@@ -1,0 +1,13 @@
+{
+  "thresholds": {
+    "notifyRoiBelow": 2,
+    "closeChargeAbove": 30,
+    "closeRoiBelow": 1.5
+  },
+  "limits": {
+    "pageSize": 500,
+    "maxPages": 50,
+    "retries": 2,
+    "requestTimeoutSeconds": 90
+  }
+}

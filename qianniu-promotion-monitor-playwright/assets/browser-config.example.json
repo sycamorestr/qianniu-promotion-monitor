@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "browser": "Edge",
+  "user_data_dir": "../profiles/shop01",
+  "profile_directory": "Default",
+  "remote_debugging_port": 9224,
+  "download_dir": "../downloads/shop01",
+  "browser_sessions": {
+    "home": {
+      "url": "https://myseller.taobao.com/"
+    }
+  }
+}
