@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import subprocess
@@ -146,10 +147,26 @@ class ProfileLock:
 
 
 def _absolute_path(value: str | os.PathLike[str], *, base: Path | None = None) -> Path:
-    candidate = Path(value).expanduser()
+    candidate = Path(os.path.expandvars(os.fspath(value))).expanduser()
     if not candidate.is_absolute() and base is not None:
         candidate = base / candidate
     return candidate.resolve()
+
+
+def _validated_lock_wait(value: Any, *, field: str, maximum: int) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not 0 <= value <= maximum or not math.isfinite(value)):
+        raise BrowserControllerError(
+            f"{field} 必须是 0–{maximum} 范围内的有限数值", "configuration"
+        )
+    return float(value)
+
+
+def configured_lock_wait_ms(config: Mapping[str, Any], *, default_seconds: float = 0) -> float:
+    """Read an optional lock budget without adding defaults to frozen config."""
+    return 1000 * _validated_lock_wait(
+        config.get("lock_wait_seconds", default_seconds), field="lock_wait_seconds", maximum=120
+    )
 
 
 def _url_from_role(value: Any, role: str) -> str:
@@ -189,7 +206,7 @@ def load_browser_config(
     caller override.
     """
 
-    path = Path(config_path).expanduser().resolve()
+    path = _absolute_path(config_path)
     if not path.is_file():
         raise BrowserControllerError(f"浏览器配置不存在: {path}", "configuration")
     try:
@@ -202,6 +219,7 @@ def load_browser_config(
         raise BrowserControllerError(
             f"浏览器配置 schema_version 必须为 {SUPPORTED_SCHEMA}", "configuration"
         )
+    configured_lock_wait_ms(value)
     data_dir = value.get("user_data_dir")
     if not isinstance(data_dir, str) or not data_dir.strip():
         raise BrowserControllerError("浏览器配置缺少 user_data_dir", "configuration")
@@ -241,6 +259,18 @@ def load_browser_config(
     normalized["download_root"] = str(download_dir)
     normalized["playwright"] = dict(playwright)
     normalized["playwright"].update({"profile_directory": selected_profile, "download_dir": str(download_dir)})
+    for section in (normalized, normalized["playwright"]):
+        for key in ("executable_path", "browser_executable"):
+            raw_path = section.get(key)
+            if not raw_path:
+                continue
+            if not isinstance(raw_path, str):
+                raise BrowserControllerError(f"{key} 必须是路径字符串", "configuration")
+            expanded = os.path.expandvars(os.path.expanduser(raw_path))
+            # Existing absolute strings are already interpreted correctly;
+            # keep their spelling so old frozen browser identities stay valid.
+            if expanded != raw_path or not Path(expanded).is_absolute():
+                section[key] = str(_absolute_path(raw_path, base=root))
     normalized["browser_sessions"] = dict(sessions)
     return normalized, path
 
@@ -372,7 +402,7 @@ def _resolve_browser_executable(config: Mapping[str, Any]) -> Path:
             if isinstance(config.get("playwright"), Mapping) else None)
     )
     if configured:
-        executable = Path(str(configured)).expanduser().resolve()
+        executable = _absolute_path(str(configured))
         if executable.is_file():
             return executable
         raise BrowserControllerError(
@@ -535,7 +565,7 @@ async def _terminate_owned_process(process: subprocess.Popen[Any] | None, pid: i
 
 
 class PlaywrightBrowserController:
-    """Attach to one native Edge CDP context and reuse configured role pages."""
+    """Attach to one native Edge/Chrome CDP context and reuse role pages."""
 
     def __init__(
         self,
@@ -543,7 +573,7 @@ class PlaywrightBrowserController:
         *,
         headless: bool = False,
         timeout_ms: int = 30_000,
-        lock_wait_ms: int = 0,
+        lock_wait_ms: int | float | None = None,
         retain_on_page_error: bool = False,
     ) -> None:
         self.config = dict(config)
@@ -551,7 +581,8 @@ class PlaywrightBrowserController:
         self.config.setdefault("download_dir", str(Path(self.config["user_data_dir"]) / "downloads" / self.config["profile_directory"]))
         self.headless = bool(headless)
         self.timeout_ms = int(timeout_ms)
-        self.lock_wait_ms = max(0, min(int(lock_wait_ms), 5_000))
+        self.lock_wait_ms = (configured_lock_wait_ms(self.config) if lock_wait_ms is None else
+                             _validated_lock_wait(lock_wait_ms, field="lock_wait_ms", maximum=120_000))
         self.retain_on_page_error = bool(retain_on_page_error)
         self.specs = role_specs(self.config)
         self.playwright: Any = None
@@ -573,11 +604,11 @@ class PlaywrightBrowserController:
         return cls(config, **kwargs)
 
     async def start(self, *, open_missing: bool = True) -> dict[str, Any]:
-        """Explicit setup entry point: may launch Edge or open missing roles."""
+        """Explicit setup: may launch the configured browser or open missing roles."""
         return await self._open(allow_launch=True, open_missing=open_missing)
 
     async def connect(self, *, open_missing: bool = False) -> dict[str, Any]:
-        """Attach to existing Edge; optionally restore missing role URLs once.
+        """Attach to an existing browser; optionally restore missing role URLs once.
 
         Diagnostics keep the default read-only page registration. Business
         jobs opt in to initial missing-page recovery, without gaining browser
@@ -587,7 +618,7 @@ class PlaywrightBrowserController:
 
     async def _acquire_profile_lock(self) -> None:
         """Wait only for the local job mutex, before touching any browser."""
-        deadline = time.monotonic() + min(self.lock_wait_ms, max(0, self.timeout_ms)) / 1000
+        deadline = time.monotonic() + self.lock_wait_ms / 1000
         try:
             while True:
                 try:
@@ -614,7 +645,7 @@ class PlaywrightBrowserController:
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise BrowserControllerError(
-                "未安装 Playwright；请在运行环境安装 playwright Python 包。当前配置使用本机 Edge，不要求下载 Chromium",
+                "未安装 Playwright；请在运行环境安装 playwright Python 包。使用本机 Edge/Chrome，不要求下载 Chromium",
                 "dependency_missing",
             ) from exc
         data_dir = Path(str(self.config["user_data_dir"])).expanduser().resolve()

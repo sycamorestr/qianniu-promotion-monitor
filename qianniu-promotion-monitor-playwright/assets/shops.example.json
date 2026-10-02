@@ -7,12 +7,6 @@
       "browser_config": "config/shop01.json",
       "login_username": "示例主账号:示例子账号",
       "expected_alimama_shop": "示例旗舰店一"
-    },
-    {
-      "id": "shop02",
-      "store": "示例旗舰店二",
-      "browser_config": "config/shop02.json",
-      "expected_alimama_shop": "示例旗舰店二"
     }
   ]
 }

@@ -223,6 +223,10 @@ def retry_requests(path, state):
 async def inspect_shop(run_dir, state, shop, record, retries, adapter_factory, connect_only, *, recovering=False):
     config = state["config"]
     is_resume = recovering or record is not None
+    previous_cleanup = copy.deepcopy((record or {}).get("browser_cleanup", {}))
+    previous_cleanup_pending = bool(record and state.get("close_after_shop", False) and (
+        record.get("status") in {"running", "closing"} or previous_cleanup.get("error")
+        or previous_cleanup.get("status") in {"open", "pending"}))
     record = record or {"id": shop["id"], "store": shop["store"], "status": "pending", "scan_complete": False,
                         "rows": [], "low_roi": [], "candidates": [], "attempts": [], "errors": []}
     shop = dict(shop)
@@ -367,7 +371,16 @@ async def inspect_shop(run_dir, state, shop, record, retries, adapter_factory, c
         if record["status"] == "closing":
             record["status"] = previous_status or "needs_review"
         cleanup = getattr(adapter, "lifecycle_result", None)
-        if state.get("close_after_shop", False) and had_business_record and (not cleanup or cleanup.get("status") != "closed"):
+        lock_blocked_before_connect = (cleanup is not None and cleanup.get("status") == "not_connected"
+                                      and cleanup.get("reason") == "profile_lock_busy")
+        if lock_blocked_before_connect and previous_cleanup_pending:
+            # A blocked resume cannot prove that an earlier browser was closed.
+            cleanup = copy.deepcopy(cleanup)
+            cleanup["unresolved_previous_cleanup"] = True
+            cleanup.setdefault("error", previous_cleanup.get("error") or {
+                "code": "browser_close_failed", "message": "上次浏览器收尾尚未确认完成，需要恢复处理"})
+        if (state.get("close_after_shop", False) and had_business_record
+                and not lock_blocked_before_connect and (not cleanup or cleanup.get("status") != "closed")):
             cleanup = copy.deepcopy(cleanup or {"status": "open"})
             cleanup.setdefault("error", {"code": "browser_close_failed", "message": "浏览器关闭未确认完成，需要恢复处理"})
         if cleanup is not None:
@@ -416,8 +429,8 @@ def messages(run_dir, state):
     if state["mode"] != "execute":
         lines.append("> 本次仅巡检，未执行暂停")
     candidates = []
-    def clean(value):
-        return str(value).replace("\n", " ").replace("<", "〈").replace(">", "〉")[:100]
+    def clean(value, limit=100):
+        return str(value).replace("\n", " ").replace("<", "〈").replace(">", "〉")[:limit]
     def metric(row):
         display = lambda value: f"{metric_value(value):.2f}"
         return f"<font color=\"comment\">ROI {display(row.get('roi'))}｜花费 {display(row.get('charge'))}</font>"
@@ -428,8 +441,13 @@ def messages(run_dir, state):
         if not record:
             lines.append("- 本店未执行，批次已提前停止")
             continue
+        cleanup = record.get("browser_cleanup", {})
+        lock_blocked_before_connect = (cleanup.get("status") == "not_connected"
+                                      and cleanup.get("reason") == "profile_lock_busy")
         if record.get("browser_cleanup", {}).get("error"):
             lines.append("- 会话保存或浏览器关闭未完成，已停止继续打开后续店铺")
+        if lock_blocked_before_connect:
+            lines.append("- 本店目录被其他任务占用，本次未执行，需释放后恢复")
         if record["status"] != "complete" and record.get("errors"):
             codes = {item["code"] for item in record.get("last_run_errors", record["errors"])}
             if "login_required" in codes:
@@ -437,10 +455,11 @@ def messages(run_dir, state):
             elif "identity_mismatch" in codes:
                 lines.append("- 店铺身份核验未通过，需要复核账号")
         if not record["scan_complete"]:
-            lines.append("- 本店巡检未完成，请检查登录及页面状态")
+            if not lock_blocked_before_connect:
+                lines.append("- 本店巡检未完成，请检查登录及页面状态")
             if not record["rows"]:
                 continue
-        lines.extend(f"- {clean(row['promotionType'])} / {clean(row['campaignName'])}｜{metric(row)}" for row in record["low_roi"])
+        lines.extend(f"- {clean(row['promotionType'])} / {clean(row['campaignName'])}｜计划ID {clean(row['campaignId'], limit=None)}｜{metric(row)}" for row in record["low_roi"])
         if not record["low_roi"]:
             lines.append("- 暂无低 ROI 推广")
         candidates.append(record)
@@ -464,11 +483,11 @@ def messages(run_dir, state):
             if (outcome == "active" and active(latest)
                     and not select([latest], state["config"]["thresholds"])[1]):
                 note = "最新指标不符合暂停条件，无需暂停"
-            lines.append(f"- <font color=\"warning\">{clean(row['promotionType'])} / {clean(row['campaignName'])}</font>｜{note}｜{metric(row.get('latest') or row)}")
+            lines.append(f"- <font color=\"warning\">{clean(row['promotionType'])} / {clean(row['campaignName'])}</font>｜计划ID {clean(row['campaignId'], limit=None)}｜{note}｜{metric(row.get('latest') or row)}")
         paused = [row for row in record["candidates"] if row.get("outcome") == "paused"]
         if paused:
             lines.append("### 已暂停")
-            lines.extend(f"- <font color=\"info\">{clean(row['promotionType'])} / {clean(row['campaignName'])}</font>" for row in paused)
+            lines.extend(f"- <font color=\"info\">{clean(row['promotionType'])} / {clean(row['campaignName'])}</font>｜计划ID {clean(row['campaignId'], limit=None)}" for row in paused)
     yield from split_message(lines)
 
 
@@ -569,12 +588,12 @@ async def run(args, *, adapter_factory=PromotionAdapter, sender=send_wechat):
                 raise ValueError("恢复不能切换阈值或读取配置")
             if getattr(args, "keep_browser", False) and state.get("close_after_shop", False):
                 raise ValueError("恢复不能更改本轮浏览器关闭策略")
-            registry = load_registry(args.registry or state["registry"])
             selected = args.shops or state["identity"]["shop_ids"]
+            registry = load_registry(args.registry or state["registry"], shop_ids=selected)
             if selected_identity(registry, selected) != state["identity"]:
                 raise ValueError("选中店铺、顺序、账号或浏览器配置已改变")
         else:
-            registry = load_registry(args.registry)
+            registry = load_registry(args.registry, shop_ids=args.shops)
             date = args.date or datetime.now(SHANGHAI).date().isoformat()
             if datetime.strptime(date, "%Y-%m-%d").date().isoformat() != date:
                 raise ValueError("日期必须为 YYYY-MM-DD")

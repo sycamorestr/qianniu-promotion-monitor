@@ -4,6 +4,7 @@
   "user_data_dir": "../profiles/shop01",
   "profile_directory": "Default",
   "remote_debugging_port": 9224,
+  "lock_wait_seconds": 5,
   "download_dir": "../downloads/shop01",
   "browser_sessions": {
     "home": {

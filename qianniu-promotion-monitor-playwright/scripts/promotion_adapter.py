@@ -6,7 +6,8 @@ import json
 import re
 from pathlib import Path
 
-from playwright_controller import PlaywrightBrowserController, BrowserControllerError
+from browser_lock import FileMutexBusy
+from playwright_controller import PlaywrightBrowserController, BrowserControllerError, configured_lock_wait_ms
 from promotion_browser_lifecycle import save_and_close
 
 URLS = {"全站推": "https://one.alimama.com/index.html#!/manage/onesite",
@@ -84,7 +85,8 @@ class PromotionAdapter:
         self.shop, self.config, self.connect_only = shop, config, connect_only
         self.close_after_shop = close_after_shop
         self.controller = PlaywrightBrowserController(shop["browser_config_value"], timeout_ms=30_000,
-                                                      retain_on_page_error=close_after_shop)
+            lock_wait_ms=configured_lock_wait_ms(shop["browser_config_value"], default_seconds=5),
+            retain_on_page_error=close_after_shop)
         self.page = None
         self.owned_pages = []
         self.lifecycle_result = {"status": "not_connected"}
@@ -105,6 +107,12 @@ class PromotionAdapter:
             return self
         except BaseException as exc:
             error = classify_error(exc) if isinstance(exc, Exception) else exc
+            if (isinstance(exc, BrowserControllerError) and exc.code == "profile_locked"
+                    and isinstance(exc.__cause__, FileMutexBusy)):
+                # This mutex is acquired before starting Playwright or touching
+                # a browser. Other profile/port errors do not prove that.
+                self.lifecycle_result = {"status": "not_connected", "reason": "profile_lock_busy"}
+                error = PromotionError("profile_locked", "浏览器目录被其他任务占用，等待后仍未释放")
             callback = getattr(self, "on_entry_error", None)
             if callback is not None:
                 try:
@@ -145,7 +153,7 @@ class PromotionAdapter:
                         self.lifecycle_result["reason"] = exc.details.get("reason")
                     if not isinstance(exc, Exception):
                         raise
-            elif not self.close_after_shop:
+            elif not self.close_after_shop and self.lifecycle_result.get("reason") != "profile_lock_busy":
                 self.lifecycle_result = {"status": "kept"}
         finally:
             try:

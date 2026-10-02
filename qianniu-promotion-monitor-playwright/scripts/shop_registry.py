@@ -61,21 +61,35 @@ def _required_text(value: Any, message: str) -> str:
     return value
 
 
-def load_registry(path: str | os.PathLike[str], *, include_workbench: bool = True) -> dict[str, Any]:
+def load_registry(path: str | os.PathLike[str], *, include_workbench: bool = True,
+                  shop_ids: list[str] | None = None) -> dict[str, Any]:
     source = Path(path).expanduser().resolve()
-    shops = [(item, source.parent) for item in _catalog(source)]
+    shops = [(item, source.parent) for item in _catalog(source, allow_empty=True)]
     sidecar = source.with_name(".browser-workbench-shops.json")
     if include_workbench and sidecar.exists():
         shops.extend((item, sidecar.parent) for item in _catalog(sidecar, allow_empty=True))
-    result: list[dict[str, Any]] = []
+    if not shops:
+        raise RegistryError("合并后的店铺清单必须包含至少一家店铺")
+    # Resolve the selection before reading browser configurations. Unrelated
+    # workbench environments must not block an explicitly scoped shop run.
     ids: set[str] = set()
-    environments: list[tuple[Path, Path, int]] = []
-    for item, base in shops:
+    for item, _ in shops:
         sid = item.get("id")
         if not isinstance(sid, str) or not ID_RE.fullmatch(sid) or sid in {"shared", "piaoju"}:
             raise RegistryError("店铺 id 必须以小写字母开头，仅含字母、数字、下划线和连字符")
         if sid in ids:
             raise RegistryError(f"重复店铺 id: {sid}")
+        ids.add(sid)
+    if shop_ids:
+        if (any(not isinstance(sid, str) or sid not in ids for sid in shop_ids)
+                or len(set(shop_ids)) != len(shop_ids)):
+            raise RegistryError("--shops 含有未知或重复店铺")
+        selected_ids = set(shop_ids)
+        shops = [(item, base) for item, base in shops if item["id"] in selected_ids]
+    result: list[dict[str, Any]] = []
+    environments: list[tuple[Path, Path, int]] = []
+    for item, base in shops:
+        sid = item["id"]
         store = _required_text(item.get("store"), f"店铺 {sid} 的 store 无效")
         config_value = _required_text(item.get("browser_config") or item.get("config"), f"店铺 {sid} 缺少 browser_config")
         config_path = _path(base, config_value)
@@ -118,7 +132,6 @@ def load_registry(path: str | os.PathLike[str], *, include_workbench: bool = Tru
         }
         # Arbitrary source fields are not carried into job state or audit.
         result.append({**identity, "browser_config_value": effective})
-        ids.add(sid)
         environments.append((data_root, download_root, port))
     return {"schema_version": 1, "source": str(source), "shops": result}
 

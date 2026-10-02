@@ -1,14 +1,18 @@
 import asyncio
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from playwright_controller import BrowserControllerError, PlaywrightBrowserController, _same_role_page, _same_site_family
 from promotion_browser_config import PROMOTION_URL, with_promotion_page
 from shop_registry import RegistryError, load_registry, selected_identity
+import check as local_check
 
 KEYWORD_URL = "https://one.alimama.com/index.html#!/manage/search"
 
@@ -152,6 +156,84 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaises(RegistryError):
             load_registry(self.registry)
 
+    def test_selection_skips_unselected_browser_config_and_preserves_identity(self):
+        original = selected_identity(load_registry(self.registry), ["shop01"])
+        other = self.make_shop("shop02", 9402)
+        self.write(self.root / ".browser-workbench-shops.json", {"schema_version": 1, "shops": [other]})
+        config_path = self.root / "config" / "shop02.json"
+        config_path.unlink()
+        for content in (None, "not json"):
+            with self.subTest(content=content):
+                if content is not None:
+                    config_path.write_text(content, encoding="utf-8")
+                selected = load_registry(self.registry, shop_ids=["shop01"])
+                self.assertEqual([shop["id"] for shop in selected["shops"]], ["shop01"])
+                self.assertEqual(selected_identity(selected, ["shop01"]), original)
+                with self.assertRaises(RegistryError):
+                    load_registry(self.registry)
+
+    def test_selected_invalid_browser_config_still_fails(self):
+        (self.root / "config" / "shop01.json").write_text("not json", encoding="utf-8")
+        with self.assertRaises(RegistryError):
+            load_registry(self.registry, shop_ids=["shop01"])
+
+    def test_unknown_and_duplicate_selection_rejected_before_config_load(self):
+        for selection in (["unknown"], ["shop01", "unknown"], ["shop01", "shop01"]):
+            with self.subTest(selection=selection), patch("shop_registry.load_browser_config") as load_config:
+                with self.assertRaisesRegex(RegistryError, "--shops"):
+                    load_registry(self.registry, shop_ids=selection)
+                load_config.assert_not_called()
+
+    def test_check_counts_only_selected_shops_and_rejects_invalid_selection(self):
+        other = self.make_shop("shop02", 9402)
+        self.write(self.root / ".browser-workbench-shops.json", {"schema_version": 1, "shops": [other]})
+        (self.root / "config" / "shop02.json").unlink()
+        for selection, expected_exit in ((["shop01"], 0), (["shop02"], 1),
+                                         (["unknown"], 1), (["shop01", "shop01"], 1)):
+            with self.subTest(selection=selection):
+                output = io.StringIO()
+                with patch.object(sys, "argv", ["check.py", "--registry", str(self.registry), "--shops", *selection]), \
+                        patch.object(local_check.platform, "system", return_value="Windows"), \
+                        patch.object(local_check, "_resolve_browser_executable", return_value=self.root / "msedge.exe"), \
+                        patch.object(local_check.importlib.util, "find_spec", return_value=object()), redirect_stdout(output):
+                    self.assertEqual(local_check.main(), expected_exit)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["authentication"], "not_checked")
+                if expected_exit == 0:
+                    self.assertEqual(next(item for item in result["checks"] if item["name"] == "registry")["shops"], 1)
+
+    def test_empty_primary_uses_workbench_shops_without_rewriting_registry(self):
+        self.write(self.registry, {"schema_version": 1, "shops": []})
+        extra = self.make_shop("shop02", 9402)
+        sidecar = self.root / ".browser-workbench-shops.json"
+        self.write(sidecar, {"schema_version": 1, "shops": [self.shop1, extra]})
+        original_files = {path: path.read_bytes() for path in (self.registry, sidecar)}
+        loaded = load_registry(self.registry)
+        self.assertEqual([shop["id"] for shop in loaded["shops"]], ["shop01", "shop02"])
+        self.assertEqual(loaded["source"], str(self.registry))
+        self.assertEqual(loaded["shops"][0]["browser_config"], str(self.root / "config" / "shop01.json"))
+        for path, content in original_files.items():
+            self.assertEqual(path.read_bytes(), content)
+        with self.assertRaises(RegistryError):
+            load_registry(self.registry, include_workbench=False)
+
+    def test_empty_merged_registry_is_rejected(self):
+        self.write(self.registry, {"schema_version": 1, "shops": []})
+        with self.assertRaises(RegistryError):
+            load_registry(self.registry)
+        self.write(self.root / ".browser-workbench-shops.json", {"schema_version": 1, "shops": []})
+        with self.assertRaises(RegistryError):
+            load_registry(self.registry)
+
+    def test_valid_sidecar_does_not_hide_invalid_primary(self):
+        self.write(self.root / ".browser-workbench-shops.json", {"schema_version": 1, "shops": [self.shop1]})
+        for bad in ({"shops": []}, {"schema_version": 1, "shops": None},
+                    {"schema_version": 1, "shops": [None]}):
+            with self.subTest(bad=bad):
+                self.write(self.registry, bad)
+                with self.assertRaises(RegistryError):
+                    load_registry(self.registry)
+
     def test_independent_browser_directories_and_ports(self):
         cases = [
             {"user_data_dir": "../profiles/shop01"},
@@ -166,8 +248,9 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(config=config):
                 other = self.make_shop("shop02", 9402, **config)
                 self.write(self.registry, {"schema_version": 1, "shops": [self.shop1, other]})
-                with self.assertRaises(RegistryError):
-                    load_registry(self.registry)
+                for selection in (None, ["shop01", "shop02"]):
+                    with self.subTest(selection=selection), self.assertRaises(RegistryError):
+                        load_registry(self.registry, shop_ids=selection)
 
     def test_omitted_ports_still_conflict(self):
         first = self.make_shop("shop01", None)

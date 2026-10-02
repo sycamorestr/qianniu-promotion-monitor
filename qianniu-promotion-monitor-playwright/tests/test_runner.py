@@ -312,6 +312,42 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.sent[-1].startswith("# 暂停操作汇总"))
         self.assertEqual(self.record(run_dir, state)["candidates"][-1]["roi"], 0)
 
+    async def test_new_scoped_batch_ignores_unselected_broken_config(self):
+        (self.root / "shop02.json").write_text("not json", encoding="utf-8")
+        fake = FakeFactory()
+        _, state = await run_batch.run(self.args("--shops", "shop01"), adapter_factory=fake, sender=self.sender)
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["identity"]["shop_ids"], ["shop01"])
+        self.assertEqual([shop["id"] for shop in fake.constructed_shops], ["shop01"])
+        self.assertFalse(self.sent)
+
+    async def test_resume_loads_frozen_scope_without_unselected_broken_config(self):
+        fake = FakeFactory()
+        fake.enter_errors["shop01"] = PromotionError("login_required", "fixture login missing")
+        run_dir, original = await run_batch.run(self.args("--shops", "shop01"), adapter_factory=fake, sender=self.sender)
+        self.assertEqual(original["status"], "needs_review")
+        (self.root / "shop02.json").write_text("not json", encoding="utf-8")
+        resumed = FakeFactory()
+        _, state = await run_batch.run(self.args("--resume", str(run_dir)), adapter_factory=resumed, sender=self.sender)
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["identity"], original["identity"])
+        self.assertEqual([shop["id"] for shop in resumed.constructed_shops], ["shop01"])
+        self.assertFalse(any(event[0] == "pause" for event in resumed.events))
+        self.assertFalse(self.sent)
+
+    async def test_resume_rejects_reduced_frozen_scope_before_browser(self):
+        fake = FakeFactory()
+        fake.enter_errors["shop02"] = PromotionError("login_required", "fixture login missing")
+        run_dir, _ = await run_batch.run(self.args(), adapter_factory=fake, sender=self.sender)
+        state_path = run_dir / "batch-state.json"
+        original_state = state_path.read_bytes()
+        guarded = FakeFactory()
+        with self.assertRaisesRegex(ValueError, "选中店铺"):
+            await run_batch.run(self.args("--resume", str(run_dir), "--shops", "shop01"),
+                                adapter_factory=guarded, sender=self.sender)
+        self.assertFalse(guarded.events)
+        self.assertEqual(state_path.read_bytes(), original_state)
+
     async def test_resume_skips_complete_shops_and_checks_hashes_before_any_adapter(self):
         fake = FakeFactory()
         fake.enter_errors["shop02"] = PromotionError("login_required", "fixture login missing")
