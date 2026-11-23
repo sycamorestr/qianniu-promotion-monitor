@@ -92,6 +92,56 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await adapter.__aenter__()
         self.assertEqual(adapter.controller.closes, 1)
 
+    async def test_expired_startup_reports_manual_login_without_cookie_lookup(self):
+        adapter = PromotionAdapter(self.shop, self.config)
+        adapter.controller.open_error = promotion_adapter.BrowserControllerError("login page", "login_required")
+        lookup = Mock(side_effect=AssertionError("External login recovery is disabled"))
+        adapter.controller.add_cookies = AsyncMock()
+        with patch.object(promotion_adapter, "fetch_shop_cookies", lookup, create=True):
+            with self.assertRaises(PromotionError) as raised:
+                await adapter.__aenter__()
+        self.assertEqual(raised.exception.code, "login_required")
+        self.assertEqual(adapter.controller.starts, 1)
+        self.assertEqual(adapter.controller.promotion.evaluations, 0)
+        self.assertEqual(adapter.controller.closes, 1)
+        lookup.assert_not_called()
+        adapter.controller.add_cookies.assert_not_awaited()
+
+    async def test_expired_scan_stops_at_failed_type_without_repeating_queries(self):
+        for failed_type in promotion_adapter.URLS:
+            with self.subTest(failed_type=failed_type):
+                adapter = PromotionAdapter(self.shop, self.config)
+                calls = []
+                async def scan_page(_page, _filename, args):
+                    calls.append(args["type"])
+                    if args["type"] == ("keyword" if failed_type == "关键词推广" else "all-site"):
+                        raise RuntimeError("Authentication required: session expired")
+                    return {"shopName": "测试店", "nickName": "测试店:子账号", "rows": []}
+                adapter._evaluate = scan_page
+                lookup = Mock(side_effect=AssertionError("External login recovery is disabled"))
+                adapter.controller.add_cookies = AsyncMock()
+                with patch.object(promotion_adapter, "fetch_shop_cookies", lookup, create=True):
+                    with self.assertRaises(PromotionError) as raised:
+                        async with adapter:
+                            await adapter.scan("2026-11-14", True)
+                self.assertEqual(raised.exception.code, "login_required")
+                self.assertIn("人工登录", str(raised.exception))
+                self.assertEqual(calls, ["all-site", "keyword"] if failed_type == "关键词推广" else ["all-site"])
+                self.assertEqual(adapter.observed_identity, {"shopName": "测试店", "nickName": "测试店:子账号"})
+                lookup.assert_not_called()
+                adapter.controller.add_cookies.assert_not_awaited()
+
+    async def test_expired_identity_probe_stops_before_business_query(self):
+        adapter = PromotionAdapter(self.shop, self.config)
+        adapter.controller.promotion.evaluate = AsyncMock(side_effect=RuntimeError("Authentication required"))
+        adapter._evaluate = AsyncMock()
+        async with adapter:
+            with self.assertRaises(PromotionError) as raised:
+                await adapter.scan("2026-11-14", True)
+        self.assertEqual(raised.exception.code, "login_required")
+        adapter.controller.promotion.evaluate.assert_awaited_once()
+        adapter._evaluate.assert_not_awaited()
+
     async def test_cancelled_enter_detaches_and_preserves_cancellation(self):
         adapter = PromotionAdapter(self.shop, self.config)
         adapter.controller.open_error = asyncio.CancelledError()

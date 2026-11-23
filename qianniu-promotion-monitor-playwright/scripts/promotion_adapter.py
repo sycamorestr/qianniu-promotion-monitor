@@ -70,10 +70,14 @@ def classify_error(error: Exception) -> PromotionError:
         uncertain = PromotionError("write_uncertain", "暂停请求结果未知，必须定向回查", write_attempted=True)
         uncertain.auth_required = bool(re.search(r"Authentication required|not logged|session.*(?:expired|invalid)|未登录|登录.*(?:过期|失效)", text, re.I))
         return uncertain
-    if re.search(r"Authentication required|Logged-in shop identity is unavailable|not logged|session.*(?:expired|invalid)|未登录|登录.*(?:过期|失效)|(?:passport|login)\.", text, re.I):
+    if re.search(r"captcha|验证码|滑块|安全验证|风控|\b429\b|too many requests|rate.limit", text, re.I):
+        return PromotionError("page_request_failed", "页面验证或访问限制未解除，保留现场待人工处理")
+    if re.search(r"identity.*(?:mismatch|does not match)|expected-shop|expected-account|name does not match", text, re.I):
+        return PromotionError("identity_mismatch", "页面店铺、账号或计划身份与本次配置不符")
+    if re.search(r"Authentication required|not logged|session.*(?:expired|invalid)|未登录|登录.*(?:过期|失效)|(?:passport|login)\.", text, re.I):
         return PromotionError("login_required", "本店登录已失效，需要人工登录")
     if re.search(r"identity|expected-shop|expected-account|name does not match", text, re.I):
-        return PromotionError("identity_mismatch", "页面店铺、账号或计划身份与本次配置不符")
+        return PromotionError("identity_mismatch", "页面未能核验完整店铺与账号身份")
     marker = re.search(r"\[PAUSE_PRECHECK:([A-Z_]+)\]", text)
     if marker and "Pause outcome uncertain" not in text:
         return PromotionError("precheck_rejected", "暂停前复核未通过: " + marker.group(1), write_attempted=False)
@@ -86,7 +90,7 @@ class PromotionAdapter:
         self.close_after_shop = close_after_shop
         self.controller = PlaywrightBrowserController(shop["browser_config_value"], timeout_ms=30_000,
             lock_wait_ms=configured_lock_wait_ms(shop["browser_config_value"], default_seconds=5),
-            retain_on_page_error=close_after_shop)
+            retain_on_page_error=True)
         self.page = None
         self.owned_pages = []
         self.lifecycle_result = {"status": "not_connected"}
