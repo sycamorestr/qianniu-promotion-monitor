@@ -1,3 +1,7 @@
 {
-  "wechat_webhook_url": ""
+  "wechat_webhook_url": "",
+  "feishu_cookie_recovery": {
+    "settings_file": "",
+    "shop_names": {}
+  }
 }

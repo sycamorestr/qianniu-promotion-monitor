@@ -371,6 +371,9 @@ async def inspect_shop(run_dir, state, shop, record, retries, adapter_factory, c
         if record["status"] == "closing":
             record["status"] = previous_status or "needs_review"
         cleanup = getattr(adapter, "lifecycle_result", None)
+        recovery = getattr(adapter, "login_recovery", None)
+        if recovery is not None:
+            record["login_recovery"] = copy.deepcopy(recovery)
         lock_blocked_before_connect = (cleanup is not None and cleanup.get("status") == "not_connected"
                                       and cleanup.get("reason") == "profile_lock_busy")
         if lock_blocked_before_connect and previous_cleanup_pending:

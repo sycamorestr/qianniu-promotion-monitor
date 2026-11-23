@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import unittest
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -75,6 +77,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.sleep_patch = patch.object(promotion_adapter.asyncio, "sleep", AsyncMock())
         self.sleep_patch.start()
         self.addCleanup(self.sleep_patch.stop)
+        self.recovery_patch = patch.object(promotion_adapter, "recovery_config", return_value=None)
+        self.recovery_config = self.recovery_patch.start()
+        self.addCleanup(self.recovery_patch.stop)
 
     async def test_connect_only_never_starts_and_detach_preserves_borrowed_page(self):
         adapter = PromotionAdapter(self.shop, self.config, connect_only=True)
@@ -141,6 +146,46 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "login_required")
         adapter.controller.promotion.evaluate.assert_awaited_once()
         adapter._evaluate.assert_not_awaited()
+
+    async def test_startup_login_failure_recovers_exact_shop_before_scan(self):
+        adapter = PromotionAdapter(self.shop, self.config)
+        page = adapter.controller.promotion
+        page.url = "https://one.alimama.com/index.html#!/login/index"
+        page.is_closed = lambda: False
+        adapter.controller.context = SimpleNamespace(pages=[page])
+        adapter.controller.registrations = {}
+        adapter.controller.browser = object()
+        adapter.controller.open_error = promotion_adapter.BrowserControllerError("login", "login_required")
+        self.recovery_config.return_value = (Path("private.json"), {"测试店": "飞书测试店"})
+        attachment = [{"name": "cookie2", "value": "fixture", "domain": ".alimama.com"}]
+        installed = []
+
+        @asynccontextmanager
+        async def replace(browser, selected, cookies):
+            installed.append((browser, selected, cookies))
+            yield
+
+        with patch.object(promotion_adapter, "fetch_shop_cookies", return_value=attachment) as fetch, \
+             patch.object(promotion_adapter, "replace_alimama_cookies", replace):
+            async with adapter:
+                self.assertEqual(adapter.observed_identity["shopName"], "测试店")
+                self.assertEqual(adapter.login_recovery, {"status": "verified", "cookie_count": 1})
+                self.assertEqual(installed, [(adapter.controller.browser, page, attachment)])
+                with self.assertRaises(PromotionError):
+                    await adapter._recover_login(page, "全站推", PromotionError("login_required", "expired"))
+        fetch.assert_called_once_with(Path("private.json"), "飞书测试店")
+
+    async def test_read_only_scan_retries_only_the_failed_promotion_type(self):
+        adapter = PromotionAdapter(self.shop, self.config)
+        adapter.page = adapter.controller.promotion
+        identity = {"shopName": "测试店", "nickName": "测试店:子账号", "rows": []}
+        with patch.object(adapter, "_evaluate", AsyncMock(side_effect=[
+            identity, PromotionError("login_required", "expired"), identity,
+        ])) as read, patch.object(adapter, "_recover_login", AsyncMock(return_value=adapter.page)) as recover:
+            self.assertEqual(await adapter.scan("2026-11-23", True), [])
+        self.assertEqual([call.args[-1]["type"] for call in read.await_args_list],
+                         ["all-site", "keyword", "keyword"])
+        recover.assert_awaited_once()
 
     async def test_cancelled_enter_detaches_and_preserves_cancellation(self):
         adapter = PromotionAdapter(self.shop, self.config)

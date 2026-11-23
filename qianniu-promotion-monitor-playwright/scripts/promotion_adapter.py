@@ -5,9 +5,15 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from browser_lock import FileMutexBusy
-from playwright_controller import PlaywrightBrowserController, BrowserControllerError, configured_lock_wait_ms
+from feishu_cookie_recovery import (
+    CookieRecoveryError, CookieRollbackError, fetch_shop_cookies, is_challenge, recovery_config, replace_alimama_cookies,
+)
+from playwright_controller import (
+    BrowserControllerError, PageRegistration, PlaywrightBrowserController, _url_is_login, configured_lock_wait_ms,
+)
 from promotion_browser_lifecycle import save_and_close
 
 URLS = {"全站推": "https://one.alimama.com/index.html#!/manage/onesite",
@@ -96,16 +102,26 @@ class PromotionAdapter:
         self.lifecycle_result = {"status": "not_connected"}
         self.cleanup_errors = []
         self.observed_identity = None
+        self.login_recovery = None
+        self.recovery_unsafe = False
         saved_identity = shop.get("observed_identity")
         if saved_identity is not None:
             self.observed_identity = self._validate_identity(saved_identity)
 
     async def __aenter__(self):
         try:
-            if self.connect_only:
-                await self.controller.connect(open_missing=True)
-            else:
-                await self.controller.start(open_missing=True)
+            try:
+                if self.connect_only:
+                    await self.controller.connect(open_missing=True)
+                else:
+                    await self.controller.start(open_missing=True)
+            except BrowserControllerError as exc:
+                if exc.code != "login_required":
+                    raise
+                registration = getattr(self.controller, "registrations", {}).get("promotion")
+                registered_page = registration.page if registration is not None else None
+                self.page = await self._recover_login(registered_page, "全站推", exc)
+                self.controller.registrations["promotion"] = PageRegistration("promotion", self.page, created=registration is None)
             self.lifecycle_result = {"status": "open"}
             self.page = self.controller.page("promotion")
             return self
@@ -142,7 +158,11 @@ class PromotionAdapter:
                     await asyncio.wait_for(page.close(), 5)
                 except Exception:
                     pass
-            if self.close_after_shop and getattr(self.controller, "browser", None) is not None:
+            if self.recovery_unsafe:
+                error = {"code": "cookie_sync_failed", "message": "旧会话还原未确认，浏览器保留供核验"}
+                self.cleanup_errors.append(error)
+                self.lifecycle_result = {"status": "open", "error": error}
+            elif self.close_after_shop and getattr(self.controller, "browser", None) is not None:
                 try:
                     self.lifecycle_result = await save_and_close(self.controller)
                 except BaseException as exc:
@@ -208,6 +228,74 @@ class PromotionAdapter:
         self.observed_identity = self._validate_identity(value)
         return self.observed_identity
 
+    async def _recover_login(self, page, promotion_type, cause):
+        controller = self.controller
+        if self.login_recovery is not None or getattr(controller, "context", None) is None or not getattr(controller, "browser", None):
+            raise cause
+        try:
+            config = recovery_config()
+        except CookieRecoveryError as exc:
+            self.login_recovery = {"status": "failed", "reason": str(exc)}
+            raise PromotionError("login_required", str(exc)) from None
+        if config is None:
+            raise cause
+        settings_file, aliases = config
+        present_pages = controller.context.pages if page is None else [page]
+        for current in present_pages:
+            url = current.url
+            parsed = urlsplit(url)
+            if parsed.hostname not in ("login.taobao.com", "pass.alimama.com", "one.alimama.com"):
+                continue
+            if is_challenge(url):
+                raise PromotionError("page_request_failed", "页面验证未解除")
+            if (parsed.hostname, parsed.path) in (("login.taobao.com", "/jump"), ("pass.alimama.com", "/add")):
+                try:
+                    await current.wait_for_url(re.compile(r"^https://one\.alimama\.com/.*#!/manage/"), timeout=5000)
+                except Exception:
+                    if is_challenge(current.url):
+                        raise PromotionError("page_request_failed", "页面验证未解除") from None
+                    if urlsplit(current.url).hostname in ("login.taobao.com", "pass.alimama.com"):
+                        raise PromotionError("page_request_failed", "单点登录跳转未结束") from None
+                else:
+                    await self._navigate(current, promotion_type)
+                    await self._probe_identity(current, promotion_type)
+                    return current
+            elif parsed.hostname == "one.alimama.com" and _url_is_login(url):
+                page = current
+        self.login_recovery = {"status": "failed", "reason": "恢复未完成"}
+        try:
+            label = aliases.get(self.shop["store"], self.shop["store"])
+            cookies = await asyncio.to_thread(fetch_shop_cookies, settings_file, label)
+            if page is None or page.is_closed():
+                page = await controller.context.new_page()
+            else:
+                await page.goto("about:blank", wait_until="commit", timeout=10_000)
+            async with replace_alimama_cookies(controller.browser, page, cookies):
+                try:
+                    await self._navigate(page, promotion_type)
+                    await self._probe_identity(page, promotion_type)
+                except BaseException:
+                    # Stop the failed page's requests before restoring the old session.
+                    try:
+                        await page.goto("about:blank", wait_until="commit", timeout=3_000)
+                    except Exception:
+                        pass
+                    raise
+        except CookieRollbackError as exc:
+            self.recovery_unsafe = True
+            self.login_recovery["reason"] = str(exc)
+            raise PromotionError("cookie_sync_failed", str(exc)) from None
+        except CookieRecoveryError as exc:
+            self.login_recovery["reason"] = str(exc)
+            raise PromotionError("login_required", str(exc)) from None
+        except Exception as exc:
+            failure = classify_error(exc)
+            reason = "飞书会话未通过阿里妈妈账号核验"
+            self.login_recovery["reason"] = reason
+            raise PromotionError(failure.code, reason) from None
+        self.login_recovery = {"status": "verified", "cookie_count": len(cookies)}
+        return page
+
     async def _navigate(self, page, promotion_type: str):
         await page.goto(URLS[promotion_type], wait_until="domcontentloaded", timeout=30_000)
         # Preserve the upstream adapter's settling interval for the SPA report runtime.
@@ -227,7 +315,7 @@ class PromotionAdapter:
                 return await asyncio.wait_for(page.evaluate(expression), self.config["limits"]["requestTimeoutSeconds"])
             except Exception as exc:
                 first_line = str(exc).splitlines()[0] if str(exc) else ""
-                ready_error = re.fullmatch(r"(?:Page\.evaluate: )?(?:Error: )?(?:(?:Campaign|all-site campaign|keyword campaign) list is not ready|Identity probe is not ready)", first_line)
+                ready_error = re.fullmatch(r"(?:Page\.evaluate: )?(?:Error: )?(?:(?:Campaign|all-site campaign|keyword campaign) list is not ready|Identity probe is not ready|Logged-in shop identity is unavailable)", first_line)
                 if attempt < ready_attempts and ready_error:
                     await asyncio.sleep(.5)
                     continue
@@ -242,18 +330,25 @@ class PromotionAdapter:
             try:
                 await self._navigate(self.page, promotion_type)
                 await self._probe_identity(self.page, promotion_type)
-                args = self._args(promotion_type, date, is_rt)
-                if selected is not None:
-                    args["targets"] = selected
-                result = await self._evaluate(self.page, "scan_campaigns.js", args)
+                result = await self._scan_page(promotion_type, date, is_rt, selected)
             except Exception as exc:
-                raise classify_error(exc) from exc
+                error = classify_error(exc)
+                if error.code != "login_required":
+                    raise error from exc
+                self.page = await self._recover_login(self.page, promotion_type, error)
+                result = await self._scan_page(promotion_type, date, is_rt, selected)
             if not isinstance(result, dict) or not isinstance(result.get("rows"), list):
                 raise PromotionError("invalid_data", "扫描结果缺少完整列表")
             self._validate_identity(result)
             for row in result.get("rows", []):
                 rows.append({**row, "shopId": self.shop["id"], "store": self.shop["store"], "accountNick": result.get("nickName")})
         return rows
+
+    async def _scan_page(self, promotion_type, date, is_rt, selected):
+        args = self._args(promotion_type, date, is_rt)
+        if selected is not None:
+            args["targets"] = selected
+        return await self._evaluate(self.page, "scan_campaigns.js", args)
 
     async def pause(self, row: dict) -> dict:
         # A fresh owned page isolates an uncertain write from subsequent targets.
